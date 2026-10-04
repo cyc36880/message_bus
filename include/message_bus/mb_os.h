@@ -52,8 +52,24 @@ typedef union mb_mutex {
 
 #elif MB_CONFIG_OS == MB_OS_FREERTOS
 
+/*
+ * FreeRTOS 头文件位置随发行版而异：
+ *   - ESP-IDF / Arduino-ESP32：<freertos/FreeRTOS.h>、<freertos/semphr.h>
+ *   - 独立 FreeRTOS 工程：直接在 include 根目录下的 <FreeRTOS.h>、<semphr.h>
+ * 用 __has_include 自动探测，两种布局都能编译，无需工程侧配置。
+ */
+#if defined(__has_include)
+#if __has_include("freertos/FreeRTOS.h")
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#else
 #include "FreeRTOS.h"
 #include "semphr.h"
+#endif
+#else
+#include "FreeRTOS.h"
+#include "semphr.h"
+#endif
 
 typedef union mb_mutex {
     SemaphoreHandle_t freertos; /**< xSemaphoreCreateRecursiveMutex() 的句柄 */

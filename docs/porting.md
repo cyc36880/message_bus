@@ -3,11 +3,16 @@
 本库只需要平台提供 **7 个函数**：一把递归锁（4 个操作）、毫秒时间、内存分配（3 个）。
 所有平台相关代码都收敛在 `port/` 下的**单个 `.c` 文件**里，换平台不需要改动 `src/` 任何一行。
 
+每个 port 文件都用 `#if MB_CONFIG_OS == MB_OS_XXX` 包住整个实现，**未被选中时编译为空目标文件**。
+因此 Arduino / PlatformIO 这类会递归扫描并编译库内所有 `.c` 的构建系统，即使多编译了别的
+port 文件也不会有副作用（只会多出一个空 `.o`）。若选中的后端文件缺失，会在链接阶段提示
+`undefined reference to mb_os_mutex_create`。
+
 ---
 
 ## 0. 选择 port
 
-| 场景 | `MB_CONFIG_OS` | 参与编译的文件 |
+| 场景 | `MB_CONFIG_OS` | 产生代码的文件 |
 |---|---|---|
 | PC 模拟器（Windows） | `MB_OS_WIN32` | `port/mb_os_win32.c` |
 | PC 模拟器（Linux / macOS） | `MB_OS_POSIX` | `port/mb_os_posix.c` |
@@ -68,6 +73,35 @@ port/mb_os_freertos.c          ← 只加这一个 port 文件
 或者直接在 IDE 的预定义宏里填。）
 
 完整配置项见 [`config/mb_conf_template.h`](../config/mb_conf_template.h)。
+
+### 1.2.1 Arduino / PlatformIO（ESP32 等）
+
+库自带 [`library.json`](../library.json)，PlatformIO 会自动：
+
+- 把 `include/` 加进头文件搜索路径；
+- 编译 `src/*.c` 与 `port/*.c`（未被选中的 port 编译为空文件）。
+
+工程侧只需要：
+
+```ini
+; platformio.ini
+build_flags =
+    -D MB_CONF_PATH="\"mb_conf.h\""
+```
+
+并让 `mb_conf.h` 里写着：
+
+```c
+#define MB_CONFIG_OS MB_OS_FREERTOS
+```
+
+Arduino-ESP32 / ESP-IDF 的 FreeRTOS 头文件位于 `freertos/` 子目录
+（`freertos/FreeRTOS.h`、`freertos/semphr.h`、`freertos/task.h`），
+而独立 FreeRTOS 工程通常直接在根目录。`mb_os.h` 与 `mb_os_freertos.c`
+用 `__has_include` 自动探测这两种布局，**无需任何额外的 `-I` 配置**。
+
+`configUSE_RECURSIVE_MUTEXES` 与 `configSUPPORT_DYNAMIC_ALLOCATION` 在
+Arduino-ESP32 的默认配置里已经是 `1`，可直接使用。
 
 ### 1.3 任务骨架
 
@@ -355,9 +389,9 @@ ctest --test-dir build --output-on-failure
 /* port/mb_os_rtthread.c */
 #include "message_bus/mb_config.h"
 
-#if MB_CONFIG_OS != MB_OS_RTTHREAD     /* 需要在 mb_config.h 里加这个枚举值 */
-#error "mb_os_rtthread.c 只在 MB_CONFIG_OS == MB_OS_RTTHREAD 时参与编译"
-#endif
+/* 未被选中时编译为空文件：这样递归扫描 .c 的构建系统（Arduino/PlatformIO）
+ * 可以放心地把所有 port 文件一起编译。需要在 mb_config.h 里加 MB_OS_RTTHREAD。 */
+#if MB_CONFIG_OS == MB_OS_RTTHREAD
 
 #include "message_bus/mb_os.h"
 #include <rtthread.h>
@@ -402,6 +436,8 @@ void *mb_os_calloc(size_t count, size_t size)
     return ptr;
 }
 void  mb_os_free(void *ptr)                 { rt_free(ptr); }
+
+#endif /* MB_CONFIG_OS == MB_OS_RTTHREAD */
 ```
 
 顺便还要在 `mb_os.h` 里加上对应的类型分支：
@@ -420,7 +456,7 @@ typedef union mb_mutex {
 - [ ] `mb_os_time_ms()` 单调递增，且**无符号回绕语义**正确（`t2 - t1` 在回绕后仍正确）
 - [ ] `mb_os_calloc()` 做了乘法溢出检查
 - [ ] **没有实现/使用 `realloc`** —— 库刻意不用它，很多 RTOS 堆没有
-- [ ] 编译期 `#error` 守卫写上了（避免 port 文件被误编进别的平台）
+- [ ] 用 `#if MB_CONFIG_OS == ...` 包住整个实现（未选中时编译为空文件）
 - [ ] 跑通 `ctest` 里的 `threads` 套件（4 线程 × 500 条消息的并发测试）
 
 最后一条最重要 —— 它是唯一能真正验证「锁确实是对的」的手段，

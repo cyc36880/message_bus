@@ -1,0 +1,16 @@
+{
+  "name": "message_bus",
+  "version": "1.0.0",
+  "description": "In-process MQTT-style message bus for decoupling LVGL from hardware",
+  "keywords": ["mqtt", "pubsub", "message-bus", "lvgl", "freertos", "embedded"],
+  "build": {
+    "srcDir": ".",
+    "includeDir": "include",
+    "srcFilter": [
+      "+<src/*.c>",
+      "+<port/*.c>"
+    ]
+  },
+  "frameworks": "*",
+  "platforms": "*"
+}

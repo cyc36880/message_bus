@@ -19,9 +19,12 @@
  */
 #include "message_bus/mb_config.h"
 
-#if MB_CONFIG_OS != MB_OS_NONE
-#error "mb_os_none.c only compiles when MB_CONFIG_OS == MB_OS_NONE"
-#endif
+/*
+ * 只有被选中的后端才产生代码；未选中时本文件编译为空目标文件。
+ * 这样 Arduino / PlatformIO 这类会递归扫描并编译库内所有 .c 的构建系统
+ * 无需配置源文件过滤，也不会因为多编译了别的 port 文件而触发 #error。
+ */
+#if MB_CONFIG_OS == MB_OS_NONE
 
 #include "message_bus/mb_os.h"
 
@@ -111,3 +114,5 @@ void mb_os_free(void *ptr)
 {
     MB_CONFIG_FREE(ptr);
 }
+
+#endif /* MB_CONFIG_OS == MB_OS_NONE */

@@ -5,6 +5,20 @@
 
 ## [未发布]
 
+### 修复
+
+- **兼容 Arduino / PlatformIO（ESP32）**。此前 `MB_CONFIG_OS = MB_OS_FREERTOS`
+  时直接 `#include "FreeRTOS.h"`，而 Arduino-ESP32 / ESP-IDF 的头文件位于
+  `freertos/` 子目录，导致编译报 `FreeRTOS.h: No such file or directory`。
+  现在 `mb_os.h` 与 `mb_os_freertos.c` 用 `__has_include` 自动探测两种布局
+  （`freertos/FreeRTOS.h` 与根目录 `FreeRTOS.h`），无需工程侧额外配置。
+- **各 port 文件改为「未选中即编译为空」**（`#if MB_CONFIG_OS == ...` 包住实现，
+  替代原来的 `#error`）。Arduino / PlatformIO 会递归扫描并编译库内所有 `.c`，
+  原来会因多编译了其它 port 文件而中断；现在多余的 port 只产生空目标文件。
+- **新增 `library.json`**，让 PlatformIO 自动编译 `src/*.c` 与 `port/*.c`
+  并暴露 `include/` 头文件路径（原先 `port/` 不在默认扫描范围内，
+  使用总线 API 时会报 `undefined reference to mb_os_mutex_create`）。
+
 ### 新增
 
 - **可视化设计器** `tools/message-bus-designer.html`：单文件、零依赖的网页工具，

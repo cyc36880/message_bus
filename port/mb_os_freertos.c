@@ -6,11 +6,13 @@
  *
  *     #define MB_CONFIG_OS MB_OS_FREERTOS
  *
- * 并把这个文件加入工程编译列表（PC 构建时用的是 mb_os_win32.c / mb_os_posix.c，
- * 因此 PC 模拟器与 MCU 共用同一份总线代码）。
+ * 用 CMake 或手工维护编译列表时，把本文件加进去（PC 构建时用的是
+ * mb_os_win32.c / mb_os_posix.c）；Arduino / PlatformIO 则由 library.json
+ * 自动编译，无需额外配置。本文件未选中时编译为空目标文件。
  *
  * 前置条件：
- *   - FreeRTOS.h / task.h / semphr.h 在 include 路径中；
+ *   - FreeRTOS.h / task.h / semphr.h 在 include 路径中（ESP-IDF 与
+ *     Arduino-ESP32 位于 freertos/ 子目录，本文件会自动探测）；
  *   - configUSE_RECURSIVE_MUTEXES = 1（总线内部锁需要可重入）；
  *   - configSUPPORT_DYNAMIC_ALLOCATION = 1（本文件用 pvPortMalloc；
  *     若为 0，请复制本文件并把三个内存函数改成静态内存池实现）。
@@ -20,13 +22,29 @@
  */
 #include "message_bus/mb_config.h"
 
-#if MB_CONFIG_OS != MB_OS_FREERTOS
-#error "mb_os_freertos.c only compiles when MB_CONFIG_OS == MB_OS_FREERTOS"
-#endif
+/*
+ * 只有被选中的后端才产生代码；未选中时本文件编译为空目标文件。
+ * 这样 Arduino / PlatformIO 这类会递归扫描并编译库内所有 .c 的构建系统
+ * 无需配置源文件过滤，也不会因为多编译了别的 port 文件而触发 #error。
+ * 若选中的后端文件缺失，会在链接阶段报 undefined reference to mb_os_*。
+ */
+#if MB_CONFIG_OS == MB_OS_FREERTOS
 
 #include "message_bus/mb_os.h"
 
 #include <string.h>
+
+/* mb_os.h 已按发行版布局引入 FreeRTOS.h / semphr.h（ESP-IDF 与 Arduino-ESP32
+ * 位于 freertos/ 子目录）；vTaskDelay / xTaskGetTickCount 还需要 task.h。 */
+#if defined(__has_include)
+#if __has_include("freertos/task.h")
+#include "freertos/task.h"
+#else
+#include "task.h"
+#endif
+#else
+#include "task.h"
+#endif
 
 #if defined(configUSE_RECURSIVE_MUTEXES) && (configUSE_RECURSIVE_MUTEXES != 1)
 #error "message_bus requires FreeRTOS configUSE_RECURSIVE_MUTEXES = 1"
@@ -116,3 +134,5 @@ void mb_os_free(void *ptr)
 {
     vPortFree(ptr);
 }
+
+#endif /* MB_CONFIG_OS == MB_OS_FREERTOS */
