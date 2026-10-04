@@ -1,0 +1,2814 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>消息总线设计器 — message_bus</title>
+<!--
+  消息总线设计器（message-bus-designer）
+  ==========================================================================
+  用途：当一个工程里的节点多到「看代码已经理不清谁发谁收」时，用它把
+  总线 / 节点 / 发布 / 订阅的关系手工画出来、写清楚、存下来。
+
+  设计原则：
+    1. 单文件、零依赖、零构建 —— 双击就能用，也可以直接提交进仓库；
+    2. 数据一律 XML，可读可 diff，方便和代码一起进版本控制；
+    3. 所有校验规则与 C 实现逐条对齐（见下方 mbTopic* 系列函数，是
+       src/mb_topic.c 的忠实移植），保证网页上判「合法」的东西在
+       固件里也合法；
+    4. 不做代码生成 —— 这个工具只负责把关系讲清楚。
+
+  与 C 实现的语义对照见 tools/README.md。
+-->
+<style>
+:root{
+  --bg:#15181d; --bg2:#1b1f26; --bg3:#22272f; --line:#2e343e;
+  --fg:#d8dee9; --fg-dim:#8b95a5; --fg-mute:#5d6674;
+  --accent:#4c9aff; --accent-dim:#2b5c99;
+  --ok:#4ec9a0; --warn:#e3b341; --err:#f26d6d; --info:#7aa2f7;
+  --pub:#e3b341; --sub:#4ec9a0; --sys:#c678dd;
+  --radius:6px; --mono:"JetBrains Mono","Cascadia Mono",Consolas,"Courier New",monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:var(--bg); color:var(--fg);
+  font:13px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+  display:flex; flex-direction:column; overflow:hidden;
+}
+button{
+  font:inherit; color:var(--fg); background:var(--bg3); cursor:pointer;
+  border:1px solid var(--line); border-radius:var(--radius); padding:4px 10px;
+}
+button:hover{background:#2a303a; border-color:#3d4653}
+button.primary{background:var(--accent-dim); border-color:var(--accent)}
+button.primary:hover{background:#336bb3}
+button.danger:hover{background:#4a2626; border-color:var(--err); color:var(--err)}
+button.tiny{padding:1px 6px; font-size:11px; line-height:1.4}
+input,textarea,select{
+  font:inherit; color:var(--fg); background:var(--bg); width:100%;
+  border:1px solid var(--line); border-radius:var(--radius); padding:3px 6px;
+}
+input:focus,textarea:focus,select:focus{outline:none; border-color:var(--accent)}
+input.bad,textarea.bad{border-color:var(--err); background:#2a1d1d}
+input[type=checkbox]{width:auto; accent-color:var(--accent); cursor:pointer}
+textarea{resize:vertical; font-family:var(--mono); font-size:12px}
+code,.mono{font-family:var(--mono); font-size:12px}
+
+/* ── 顶栏 ───────────────────────────────────────────────────────────── */
+.topbar{
+  display:flex; align-items:center; gap:14px; padding:8px 14px;
+  background:var(--bg2); border-bottom:1px solid var(--line); flex:0 0 auto;
+}
+.brand{font-weight:600; letter-spacing:.3px; white-space:nowrap}
+.brand .ver{color:var(--fg-mute); font-weight:400; font-size:11px; margin-left:4px}
+.topbar .spacer{flex:1}
+.viewswitch{display:flex; border:1px solid var(--line); border-radius:var(--radius); overflow:hidden}
+.viewswitch button{border:none; border-radius:0; background:transparent; padding:5px 14px}
+.viewswitch button.active{background:var(--accent-dim); color:#fff}
+.actions{display:flex; gap:6px; flex-wrap:wrap}
+
+/* ── 三栏布局 ───────────────────────────────────────────────────────── */
+/* 显式写死行高：只给 grid-template-columns 的话，这一行会「按内容撑」——
+   表格内容多就撑到 800px 溢出容器，关系图内容少就缩到 253px，
+   于是三栏顶部对齐、底下留一大片空白。minmax(0,1fr) 让行严格等于容器高度，
+   再由每个 .pane 自己的 overflow:auto 去滚动。 */
+.layout{flex:1; display:grid; grid-template-columns:280px minmax(0,1fr) 340px;
+        grid-template-rows:minmax(0,1fr); min-height:0}
+.layout.no-inspector{grid-template-columns:280px minmax(0,1fr)}
+.layout.no-sidebar{grid-template-columns:minmax(0,1fr) 340px}
+.layout.no-sidebar.no-inspector{grid-template-columns:minmax(0,1fr)}
+.pane{min-height:0; overflow:auto; background:var(--bg)}
+.pane.sidebar{border-right:1px solid var(--line); background:var(--bg2); padding:10px}
+.pane.inspector{border-left:1px solid var(--line); background:var(--bg2); padding:10px}
+.pane.main{padding:14px}
+
+/* ── 侧栏 ───────────────────────────────────────────────────────────── */
+.sec-title{
+  font-size:11px; text-transform:uppercase; letter-spacing:.8px; color:var(--fg-mute);
+  margin:14px 0 6px; display:flex; align-items:center; gap:6px;
+}
+.sec-title:first-child{margin-top:0}
+.sec-title .line{flex:1; height:1px; background:var(--line)}
+.tree-bus{margin-bottom:6px}
+.tree-bus > .row{display:flex; align-items:center; gap:6px; padding:3px 4px; border-radius:var(--radius)}
+.tree-bus > .row:hover{background:var(--bg3)}
+.tree-bus .bname{font-weight:600; flex:1; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.tree-node{display:flex; align-items:center; gap:6px; padding:2px 4px 2px 18px; border-radius:var(--radius); cursor:pointer}
+.tree-node:hover{background:var(--bg3)}
+.tree-node.active{background:var(--accent-dim)}
+.tree-node .nname{flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.tree-node .cnt{color:var(--fg-mute); font-size:11px; font-family:var(--mono)}
+.dot{width:7px; height:7px; border-radius:50%; flex:0 0 auto}
+.dot.pub{background:var(--pub)} .dot.sub{background:var(--sub)} .dot.both{background:linear-gradient(90deg,var(--pub) 50%,var(--sub) 50%)}
+.dot.none{background:var(--fg-mute)}
+
+/* ── 总线区块 / 节点卡片 ────────────────────────────────────────────── */
+.bus-block{margin-bottom:22px}
+.bus-head{
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  background:var(--bg2); border:1px solid var(--line); border-radius:var(--radius);
+  padding:8px 10px; margin-bottom:10px; border-left:3px solid var(--accent);
+}
+.bus-head .bus-name{width:180px; font-weight:600; font-size:14px}
+.bus-head .bus-comment{flex:1; min-width:160px}
+.bus-head label{display:flex; align-items:center; gap:5px; color:var(--fg-dim); white-space:nowrap; font-size:12px}
+.node-card{
+  background:var(--bg2); border:1px solid var(--line); border-radius:var(--radius);
+  padding:10px; margin-bottom:10px; scroll-margin-top:10px;
+}
+.node-card.flash{animation:flash 1.1s ease-out}
+@keyframes flash{0%{border-color:var(--accent); box-shadow:0 0 0 3px rgba(76,154,255,.25)} 100%{}}
+.node-card > header{display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:8px}
+.node-card .node-name{width:170px; font-weight:600}
+.node-card .node-comment{flex:1; min-width:140px}
+.badges{display:flex; gap:6px; font-size:11px; font-family:var(--mono); white-space:nowrap}
+.badge{padding:1px 7px; border-radius:10px; border:1px solid var(--line); color:var(--fg-dim)}
+.badge.pub{border-color:#5a4a1f; color:var(--pub)}
+.badge.sub{border-color:#1f5344; color:var(--sub)}
+.badge.err{border-color:var(--err); color:var(--err)}
+.badge.warn{border-color:var(--warn); color:var(--warn)}
+
+table.grid{width:100%; border-collapse:collapse; margin-top:4px}
+table.grid th{
+  text-align:left; font-weight:500; font-size:11px; color:var(--fg-mute);
+  padding:3px 6px; border-bottom:1px solid var(--line); white-space:nowrap;
+}
+table.grid td{padding:2px 6px; vertical-align:top; border-bottom:1px solid #23282f}
+table.grid tr:last-child td{border-bottom:none}
+table.grid td.c{text-align:center}
+table.grid .cell-narrow{width:60px}
+table.grid .cell-act{width:34px; text-align:right}
+table.grid th.rowlabel{color:var(--warn)}
+.tbl-cap{display:flex; align-items:center; gap:8px; margin-top:10px}
+.tbl-cap .t{font-size:11px; letter-spacing:.5px; color:var(--fg-dim)}
+.tbl-cap.pub .t{color:var(--pub)} .tbl-cap.sub .t{color:var(--sub)}
+.hint{color:var(--fg-mute); font-size:11px; padding:2px 6px 6px}
+
+/* ── C 代码块 ───────────────────────────────────────────────────────── */
+.tbl-cap.code .t{color:var(--fg-dim)}
+pre.code{
+  margin:2px 0 10px; padding:8px 10px; background:#11151a; border:1px solid var(--line);
+  border-radius:var(--radius); overflow:auto; max-height:460px;
+  font-family:var(--mono); font-size:12px; line-height:1.5; color:#c9d4e0;
+}
+/* 每行一个块：短行背景也铺满整行，长行则撑到内容宽度（配合 pre 的横向滚动）。
+   width:max-content + min-width:100% 正好同时满足这两种情况。 */
+pre.code .cl{display:block; width:max-content; min-width:100%; padding:0 2px; border-radius:2px}
+
+/* C 语法着色。颜色是照 #11151a 这个底色挑的，别单独改其中一两个。 */
+pre.code .c-kw{color:#c678dd}                     /* keyword */
+pre.code .c-ty{color:#4ec9a0}                     /* 类型、mb_xxx_t */
+pre.code .c-st{color:#e3b341}                     /* 字符串/字符字面量 */
+pre.code .c-nu{color:#d19a66}                     /* 数字 */
+pre.code .c-cm{color:#7d8799; font-style:italic}  /* 注释 */
+pre.code .c-mc{color:#7aa2f7}                     /* 宏、NULL 这类常量 */
+pre.code .c-fn{color:#61afef}                     /* 函数名 */
+pre.code .c-pp{color:#c678dd}                     /* 预处理指令 */
+
+/* 新增/改动的代码：只闪背景，不动文字颜色，闪完自动退回透明。
+   左侧那条竖杠跟着一起淡出，让「改了哪一行」在一屏代码里一眼能认出来。
+   用 inset box-shadow 而不是 border-left —— 不占布局，不会把文字挤动。 */
+@keyframes codeflash{
+  0%  {background:#3b6fbe; box-shadow:inset 3px 0 0 var(--accent)}
+  55% {background:rgba(59,111,190,.45)}
+  100%{background:transparent; box-shadow:inset 3px 0 0 transparent}
+}
+pre.code .cl.flash{animation:codeflash 1.8s ease-out}
+
+/* ── 关系图：左键拖空白处平移整张画布 ───────────────────────────────── */
+.graph-scroll{cursor:grab}
+.graph-scroll.panning{cursor:grabbing}
+.graph-scroll.panning *{cursor:grabbing}
+
+/* ── 关系图 ─────────────────────────────────────────────────────────── */
+.graph-bus{
+  background:var(--bg2); border:1px solid var(--line); border-radius:var(--radius);
+  margin-bottom:18px; overflow:hidden;
+}
+.graph-bus > header{display:flex; align-items:baseline; gap:10px; padding:8px 12px; border-bottom:1px solid var(--line)}
+.graph-bus > header .gname{font-weight:600}
+.graph-bus > header .gmeta{color:var(--fg-mute); font-size:11px; font-family:var(--mono)}
+.graph-scroll{overflow:auto}
+/* SVG 默认是 inline，底下会多出一条基线缝，撑出无谓的滚动条；块级化即可。
+   画布高度由脚本按内容 + 可视区算出，所以这里不再限制高度。 */
+.graph-scroll svg{display:block}
+.graph-empty{padding:20px; color:var(--fg-mute); text-align:center}
+.legend{display:flex; gap:16px; padding:8px 12px; border-top:1px solid var(--line); color:var(--fg-dim); font-size:11px; flex-wrap:wrap}
+.legend i{display:inline-block; width:22px; height:0; border-top:2px solid; vertical-align:middle; margin-right:5px}
+svg text{font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.gnode rect{fill:var(--bg3); stroke:var(--line); stroke-width:1.2; cursor:grab}
+.gnode:active rect{cursor:grabbing}
+.gnode:hover rect{filter:brightness(1.25)}
+.gnode.pub rect{stroke:var(--pub)} .gnode.sub rect{stroke:var(--sub)} .gnode.both rect{stroke:var(--accent)}
+.gnode text.nm{fill:var(--fg); font-size:12px; font-weight:600; pointer-events:none}
+.gnode text.ct{fill:var(--fg-mute); font-size:10px; font-family:var(--mono); pointer-events:none}
+/* ── 边：可点、可拖、可改色，带流向动画 ─────────────────────────────── */
+/* 可见的线很细，几乎点不中，所以另外画一条透明的粗线专门用来接鼠标。 */
+.gedge-hit{fill:none; stroke:transparent; stroke-width:15; cursor:grab; pointer-events:stroke}
+.gedge-hit:active{cursor:grabbing}
+
+/* 底线压暗，让上面流动的虚线看得清；颜色由内联 style 覆盖（用户可改）。 */
+.gedge{fill:none; stroke-width:1.4; opacity:.38; pointer-events:none}
+.gedge.pub{stroke:var(--pub)}
+.gedge.orphan{stroke:var(--fg-mute); stroke-dasharray:4 3; opacity:.7}
+.gedge.self{stroke:var(--accent)}
+.gedge.sel{stroke-width:2.4; opacity:.85}
+
+/* 流向：一条虚线叠在线上。dashoffset 从 16 递减到 0（正好一个周期，
+   所以循环无缝），虚线沿路径朝终点跑 —— 也就是从发布者流向订阅者。
+   方向搞反的话，动画会在提示「数据倒着流」，所以这里别改成 0 → 16。 */
+.gflow{fill:none; stroke-width:2.4; stroke-linecap:round; opacity:.95;
+       stroke-dasharray:4 12; pointer-events:none;
+       animation:flow 1.5s linear infinite}
+.gflow.pub{stroke:var(--pub)}
+.gflow.self{stroke:var(--accent)}
+@keyframes flow{ from{stroke-dashoffset:16} to{stroke-dashoffset:0} }
+@media (prefers-reduced-motion: reduce){
+  .gflow{animation:none; stroke-dasharray:none; opacity:.5}
+}
+
+/* 标签整组可拖：拖动它就是在改这条边的形状。 */
+.glabel-g{cursor:grab}
+.glabel-g:active{cursor:grabbing}
+.glabel{font-size:10px; font-family:var(--mono); fill:var(--fg-dim); pointer-events:none}
+.glabel-bg{fill:var(--bg2); opacity:.94}
+.glabel-g:hover .glabel-bg{fill:var(--bg3)}
+.glabel-g.sel .glabel-bg{fill:var(--bg3); stroke:var(--accent); stroke-width:1}
+.glabel-g.sel .glabel{fill:var(--fg)}
+.gpill{fill:var(--bg3); stroke:var(--fg-mute); stroke-dasharray:4 3}
+.gpill-text{font-size:10px; font-family:var(--mono); fill:var(--fg-mute)}
+
+/* 选中一条边后浮出来的小面板：改颜色 / 还原 */
+.edge-panel{
+  position:fixed; z-index:60; display:none; align-items:center; gap:8px;
+  background:var(--bg3); border:1px solid var(--line); border-radius:var(--radius);
+  padding:7px 9px; box-shadow:0 8px 24px rgba(0,0,0,.5);
+  font-size:11px; color:var(--fg);
+}
+.edge-panel.show{display:flex}
+.edge-panel .ep-name{font-family:var(--mono); color:var(--fg-dim); max-width:240px;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.edge-panel input[type=color]{width:30px; height:22px; padding:0; border:1px solid var(--line);
+  background:var(--bg2); border-radius:4px; cursor:pointer}
+
+/* 图例右边的缩放控件 */
+.legend .zoom{margin-left:auto; display:flex; align-items:center; gap:5px}
+.legend .zoom b{font-family:var(--mono); min-width:40px; text-align:center; color:var(--fg-dim)}
+
+/* ── 校验面板 ───────────────────────────────────────────────────────── */
+.vgroup{margin-bottom:12px}
+.vgroup > .head{display:flex; align-items:center; gap:6px; font-size:11px; letter-spacing:.6px; margin-bottom:4px}
+.vgroup.err > .head{color:var(--err)} .vgroup.warn > .head{color:var(--warn)} .vgroup.info > .head{color:var(--info)}
+.vitem{
+  display:flex; gap:7px; padding:5px 7px; border-radius:var(--radius); cursor:pointer;
+  border-left:2px solid transparent; margin-bottom:2px; background:var(--bg3);
+}
+.vitem:hover{border-left-color:var(--accent)}
+.vitem .ico{flex:0 0 auto}
+.vitem .body{flex:1; min-width:0}
+.vitem .where{color:var(--fg-mute); font-size:11px; font-family:var(--mono); margin-top:1px}
+.vitem code{background:#12151a; padding:0 3px; border-radius:3px}
+.vnone{color:var(--ok); padding:10px; text-align:center; border:1px dashed var(--line); border-radius:var(--radius)}
+.count{background:var(--bg3); border-radius:9px; padding:0 7px; font-family:var(--mono); font-size:11px}
+
+/* ── 状态栏 / 提示 ──────────────────────────────────────────────────── */
+.statusbar{
+  flex:0 0 auto; display:flex; align-items:center; gap:14px; padding:5px 14px;
+  background:var(--bg2); border-top:1px solid var(--line);
+  color:var(--fg-dim); font-size:12px; font-family:var(--mono);
+}
+.statusbar .spacer{flex:1}
+.statusbar b{color:var(--fg); font-weight:600}
+#toast{
+  position:fixed; left:50%; bottom:52px; transform:translateX(-50%) translateY(12px);
+  background:var(--bg3); border:1px solid var(--accent); border-radius:var(--radius);
+  padding:7px 16px; opacity:0; pointer-events:none; transition:.22s; z-index:50;
+}
+#toast.show{opacity:1; transform:translateX(-50%) translateY(0)}
+#toast.err{border-color:var(--err); color:var(--err)}
+.hidden{display:none !important}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">消息总线设计器<span class="ver" id="libver">message_bus</span></div>
+  <div class="viewswitch">
+    <button id="tab-table" class="active" data-view="table">☰ 表格视图</button>
+    <button id="tab-graph" data-view="graph">◈ 关系图视图</button>
+  </div>
+  <div class="spacer"></div>
+  <div class="actions">
+    <button id="btn-new">新建</button>
+    <button id="btn-sample">载入示例</button>
+    <button id="btn-import">导入 XML</button>
+    <button id="btn-export">导出 XML</button>
+    <button id="btn-save">保存</button>
+    <button id="btn-saveas">另存为…</button>
+    <button id="btn-sidebar">◧ 侧栏</button>
+    <button id="btn-inspector">◨ 校验</button>
+  </div>
+</header>
+
+<div class="layout" id="layout">
+  <!-- 左：文档信息 + 树 -->
+  <aside class="pane sidebar" id="sidebar">
+    <div class="sec-title">文档<span class="line"></span></div>
+    <div style="margin-bottom:6px">
+      <input id="doc-title" placeholder="设计名称，例如：温室控制器 v2">
+    </div>
+    <textarea id="doc-comment" rows="3" placeholder="整体注释：这份设计要解决什么问题、有哪些约定…"></textarea>
+
+    <div class="sec-title">结构<span class="line"></span><span id="tree-count" class="count">0</span></div>
+    <div id="tree"></div>
+    <button id="btn-add-bus" style="width:100%; margin-top:8px">+ 新建总线</button>
+
+    <div class="sec-title">本地存储<span class="line"></span></div>
+    <div style="color:var(--fg-mute); font-size:11px; line-height:1.7">
+      编辑内容会自动存进浏览器 localStorage（key: <code>message-bus-designer</code>）。
+      「保存」写回上次打开的文件；想落到别的文件用「另存为」。
+    </div>
+    <button id="btn-clear-local" class="tiny danger" style="margin-top:8px">清除本地自动保存</button>
+  </aside>
+
+  <!-- 中：视图 -->
+  <main class="pane main" id="main">
+    <div id="view-table"></div>
+    <div id="view-graph" class="hidden"></div>
+  </main>
+
+  <!-- 右：校验 -->
+  <aside class="pane inspector" id="inspector">
+    <div class="sec-title">一致性校验<span class="line"></span><span id="v-total" class="count">0</span></div>
+    <div id="validation"></div>
+    <div class="sec-title">术语对照<span class="line"></span></div>
+    <div style="color:var(--fg-mute); font-size:11px; line-height:1.8">
+      <b style="color:var(--pub)">发布</b> = <code>mb_node_publish()</code><br>
+      <b style="color:var(--sub)">订阅</b> = <code>mb_node_subscribe_ex()</code><br>
+      <b style="color:var(--sys)">$mb/…</b> = 总线自动发布的节点上线/下线事件<br>
+      校验规则移植自 <code>src/mb_topic.c</code>，与固件行为一致。
+    </div>
+  </aside>
+</div>
+
+<footer class="statusbar">
+  <span id="stat-counts"></span>
+  <span class="spacer"></span>
+  <span id="stat-file">尚未保存到文件</span>
+  <span class="spacer"></span>
+  <span id="stat-state">就绪</span>
+</footer>
+
+<input type="file" id="file-input" accept=".xml,application/xml,text/xml" class="hidden">
+<div id="toast"></div>
+
+<!-- 选中关系图上的一条线之后浮出来的小面板。位置是 fixed，跟着鼠标走，
+     所以放在 body 下而不是塞进 SVG 里 —— 放进 SVG 会跟着缩放和裁剪。 -->
+<div class="edge-panel" id="edge-panel">
+  <span class="ep-name" id="ep-name"></span>
+  <input type="color" id="ep-color" value="#4c9aff" title="线条颜色">
+  <button class="tiny" id="ep-reset">还原</button>
+  <button class="tiny" id="ep-close">×</button>
+</div>
+
+<script>
+"use strict";
+/* ==========================================================================
+ * 0. 与 C 实现对齐的常量与主题工具（src/mb_topic.c / mb_config.h 的移植）
+ * ========================================================================== */
+
+/* ===== BEGIN PURE-LOGIC ===== */
+/*
+ * 下面这一段是纯粹的字符串逻辑，不碰 DOM、不碰 document，因此可以被单独
+ * 抽出来跑自检 —— tools/web-selftest.js 会从这两行标记之间取出源码，
+ * 用 C 测试（tests/test_topic.c）里的同一张用例表跑一遍。
+ *
+ * 为了能被 Windows Script Host 这个只认 ES3 的引擎解析，区域内刻意：
+ *   - 只用 let / const（会被自检脚本替换成 var），不用模板字符串、
+ *     箭头函数、解构、for...of、Map/Set；
+ *   - 错误信息用字符串拼接而不是模板字符串。
+ *
+ * 改这一区时请保持同样的克制，改完记得跑：
+ *     cscript //nologo tools\web-selftest.js
+ *
+ * 注意：两行标记必须各自是**独立且完整**的注释 —— 自检脚本是从
+ * BEGIN 那一行的行尾开始截取的，标记和说明若共用一个块注释，说明部分
+ * 会因为丢掉开头的斜杠星号而变成语法错误。
+ */
+
+const MB_CONFIG_MAX_TOPIC_LEN = 128;   /* 含结尾 '\0'，故有效长度须 < 该值 */
+const MB_CONFIG_MAX_NAME_LEN  = 32;
+const MB_SEP = "/";
+const MB_WILD_ONE = "+";
+const MB_WILD_MANY = "#";
+const MB_SYS_PREFIX = "$";
+const MB_EVENT_PREFIX = "$mb/nodes/";  /* mb_bus.c: build_node_topic() */
+
+function mbTopicIsSystem(topic){
+  return typeof topic === "string" && topic.length > 0 && topic.charAt(0) === MB_SYS_PREFIX;
+}
+
+/** 对应 mb_topic_validate_topic()：发布主题必须是具体的，不允许通配符。 */
+function mbTopicValidateTopic(topic){
+  if (!topic) return "主题不能为空";
+  if (topic.length >= MB_CONFIG_MAX_TOPIC_LEN)
+    return "主题长度须小于 " + MB_CONFIG_MAX_TOPIC_LEN + "（当前 " + topic.length + "）";
+  if (topic.indexOf(MB_WILD_ONE) !== -1 || topic.indexOf(MB_WILD_MANY) !== -1)
+    return "发布主题中不允许出现通配符 '+' 或 '#'（只有订阅过滤器可以带通配符）";
+  return null;
+}
+
+/** 对应 mb_topic_validate_filter()：'+' 与 '#' 必须各自独占一层，'#' 还必须在最后一层。 */
+function mbTopicValidateFilter(filter){
+  if (!filter) return "过滤器不能为空";
+  if (filter.length >= MB_CONFIG_MAX_TOPIC_LEN)
+    return "过滤器长度须小于 " + MB_CONFIG_MAX_TOPIC_LEN + "（当前 " + filter.length + "）";
+
+  let i = 0;
+  while (i < filter.length){
+    const start = i;
+    while (i < filter.length && filter.charAt(i) !== MB_SEP) i++;
+    const level = filter.slice(start, i);
+
+    if (level.indexOf(MB_WILD_MANY) !== -1 && (level !== MB_WILD_MANY || i !== filter.length))
+      return "'#' 必须独占一层，且必须是最后一层（例如 a/# 合法，a/#/b、a# 非法）";
+    if (level.indexOf(MB_WILD_ONE) !== -1 && level !== MB_WILD_ONE)
+      return "'+' 必须独占一层（例如 +/temp 合法，sensor_+/temp 非法）";
+
+    if (i < filter.length && filter.charAt(i) === MB_SEP) i++;
+  }
+  return null;
+}
+
+/** 对应 mb_node.c: validate_node_name()。节点名要能安全地当作主题的一层。 */
+function mbValidateNodeName(name){
+  if (!name) return "节点名不能为空";
+  if (name.length >= MB_CONFIG_MAX_NAME_LEN)
+    return "节点名长度须小于 " + MB_CONFIG_MAX_NAME_LEN + "（当前 " + name.length + "）";
+  if (name.indexOf(MB_SEP) !== -1) return "节点名不能包含 '/'（会破坏主题层级）";
+  if (name.indexOf(MB_WILD_ONE) !== -1 || name.indexOf(MB_WILD_MANY) !== -1)
+    return "节点名不能包含通配符 '+' 或 '#'";
+  if (name.charAt(0) === MB_SYS_PREFIX) return "节点名不能以 '$' 开头（'$' 是系统主题前缀）";
+  return null;
+}
+
+/** 对应 mb_topic_match()：MQTT 3.1.1 [MQTT-4.7] 匹配规则。 */
+function mbTopicMatch(filter, topic){
+  if (!filter || !topic) return false;
+  /* [MQTT-4.7.2-1] 首字符为 '$' 的主题不被首层通配符匹配 */
+  if (topic.charAt(0) === MB_SYS_PREFIX &&
+      (filter.charAt(0) === MB_WILD_ONE || filter.charAt(0) === MB_WILD_MANY))
+    return false;
+
+  let f = 0, t = 0;
+  for (;;){
+    if (filter.charAt(f) === MB_WILD_MANY) return true;  /* 过滤器已校验，'#' 必然是最后一层 */
+
+    let fEnd = filter.indexOf(MB_SEP, f); if (fEnd < 0) fEnd = filter.length;
+    let tEnd = topic.indexOf(MB_SEP, t);  if (tEnd < 0) tEnd = topic.length;
+
+    const fLevel = filter.slice(f, fEnd);
+    const tLevel = topic.slice(t, tEnd);
+
+    if (fLevel !== MB_WILD_ONE && fLevel !== tLevel) return false;
+
+    const fDone = fEnd === filter.length, tDone = tEnd === topic.length;
+    if (fDone && tDone) return true;
+    /* 主题已耗尽：仅当过滤器剩余部分恰好是 "/#" 时匹配（"sport/#" 也匹配 "sport"） */
+    if (tDone) return fEnd < filter.length && filter.slice(fEnd + 1) === MB_WILD_MANY;
+    if (fDone) return false;
+
+    f = fEnd + 1; t = tEnd + 1;
+  }
+}
+
+/** 对应 mb_dispatch.c: subscription_matches()。判断一条发布能否投递到一条订阅。 */
+function mbSubscriptionMatches(sub, topic, source){
+  if (!mbTopicMatch(sub.filter, topic)) return false;
+  if (sub.source){
+    /* 只有带来源的发布才可能命中来源过滤；总线级发布（source = NULL）永远不命中 */
+    if (!source || !mbTopicMatch(sub.source, source)) return false;
+  }
+  if (sub.nolocal && source && source === sub.nodeName) return false;
+  return true;
+}
+
+/* -------------------------------------------------------------------------
+ * 自检用例：与 tests/test_topic.c 中的断言逐条一一对应。
+ * 网页里改坏了匹配规则，这一表就会红 —— 固件和网页必须是同一套规则。
+ * ---------------------------------------------------------------------- */
+
+/* 主题匹配：[过滤器, 主题, 期望结果] */
+const TOPIC_MATCH_CASES = [
+  /* topic_exact_match */
+  ["a/b/c","a/b/c",true], ["a/b/c","a/b/d",false], ["a","a",true],
+  ["a","a/b",false], ["a/b","a",false], ["/a","/a",true],
+  ["/a","a",false], ["a//b","a//b",true],
+  /* topic_single_wildcard */
+  ["a/+/c","a/b/c",true], ["a/+/c","a/b/d",false], ["a/+/c","a/b/x/c",false],
+  ["+","a",true], ["+","a/b",false], ["a/+","a",false],
+  ["+/+/+","a/b/c",true], ["a/+/c","a//c",true],
+  /* topic_multi_wildcard */
+  ["#","a",true], ["#","a/b/c",true],
+  ["a/#","a",true], ["a/#","a/b",true], ["a/#","a/b/c/d",true], ["a/#","b",false],
+  ["a/b/#","a/b",true], ["a/b/#","a/b/c",true], ["a/b/#","a/c",false],
+  /* topic_system_prefix */
+  ["#","$mb/nodes/ui/connected",false], ["+/nodes","$mb/nodes",false],
+  ["$mb/#","$mb/nodes/ui/connected",true],
+  ["$mb/nodes/+/connected","$mb/nodes/ui/connected",true],
+  ["$mb/nodes/+/connected","$mb/nodes/ui/disconnected",false],
+  /* topic_match_null_and_empty */
+  [null,"a",false], ["a",null,false], ["","a",false], ["a","",false]
+];
+
+const FILTER_OK_CASES  = ["a/b/c", "#", "a/#", "sport/+/player1", "/", "+/+/+"];
+const FILTER_BAD_CASES = [null, "", "a/#/b", "a#", "#/a", "a+/b", "a/b+"];
+
+const TOPIC_OK_CASES   = ["motor/cmd", "a", "$mb/nodes/ui/connected"];
+const TOPIC_BAD_CASES  = [null, "", "motor/+", "motor/#"];
+
+const NAME_OK_CASES    = ["motor", "sensor_a", "ui", "a"];
+const NAME_BAD_CASES   = [null, "", "a/b", "a+b", "a#b", "$mb"];
+
+const LONG_STR = (function(){
+  let s = ""; for (let i = 0; i < MB_CONFIG_MAX_TOPIC_LEN + 8; ++i) s += "a"; return s;
+})();
+
+/**
+ * 跑一遍上面所有用例。
+ * @return {string[]} 失败描述；空数组表示全过。故意只返回英文，方便控制台显示。
+ */
+function runSelfTest(){
+  const fails = [];
+  let checks = 0;
+
+  function eq(got, want, label){
+    checks++;
+    if (got !== want) fails.push(label + " -> got " + got + ", want " + want);
+  }
+
+  let i;
+  for (i = 0; i < TOPIC_MATCH_CASES.length; ++i){
+    const c = TOPIC_MATCH_CASES[i];
+    eq(mbTopicMatch(c[0], c[1]), c[2], "mbTopicMatch(" + c[0] + ", " + c[1] + ")");
+  }
+  /* 注意：校验函数返回的是中文错误信息，这里统一折成布尔再比较 ——
+     失败信息要能原样打到非 UTF-8 的 Windows 控制台上，不能混进中文。 */
+  for (i = 0; i < FILTER_OK_CASES.length; ++i)
+    eq(mbTopicValidateFilter(FILTER_OK_CASES[i]) === null, true, "filter should be VALID: " + FILTER_OK_CASES[i]);
+  for (i = 0; i < FILTER_BAD_CASES.length; ++i)
+    eq(mbTopicValidateFilter(FILTER_BAD_CASES[i]) !== null, true, "filter should be INVALID: " + FILTER_BAD_CASES[i]);
+  for (i = 0; i < TOPIC_OK_CASES.length; ++i)
+    eq(mbTopicValidateTopic(TOPIC_OK_CASES[i]) === null, true, "topic should be VALID: " + TOPIC_OK_CASES[i]);
+  for (i = 0; i < TOPIC_BAD_CASES.length; ++i)
+    eq(mbTopicValidateTopic(TOPIC_BAD_CASES[i]) !== null, true, "topic should be INVALID: " + TOPIC_BAD_CASES[i]);
+  for (i = 0; i < NAME_OK_CASES.length; ++i)
+    eq(mbValidateNodeName(NAME_OK_CASES[i]) === null, true, "node name should be VALID: " + NAME_OK_CASES[i]);
+  for (i = 0; i < NAME_BAD_CASES.length; ++i)
+    eq(mbValidateNodeName(NAME_BAD_CASES[i]) !== null, true, "node name should be INVALID: " + NAME_BAD_CASES[i]);
+
+  /* topic_too_long */
+  eq(mbTopicValidateTopic(LONG_STR) !== null, true, "over-long topic should be INVALID");
+  eq(mbTopicValidateFilter(LONG_STR) !== null, true, "over-long filter should be INVALID");
+
+  /* 来源过滤 + NOLOCAL：对应 mb_dispatch.c: subscription_matches() */
+  eq(mbSubscriptionMatches({filter:"#", source:"sensor_a", nolocal:false, nodeName:"logger"},
+                           "sensor_a/temp", "sensor_a"), true, "source filter should match");
+  eq(mbSubscriptionMatches({filter:"#", source:"sensor_a", nolocal:false, nodeName:"logger"},
+                           "sensor_b/temp", "sensor_b"), false, "source filter should reject other sources");
+  eq(mbSubscriptionMatches({filter:"#", source:"sensor_a", nolocal:false, nodeName:"logger"},
+                           "sensor_a/temp", null), false, "bus-level publish (source = NULL) must not match a source filter");
+  eq(mbSubscriptionMatches({filter:"#", source:null, nolocal:true, nodeName:"sensor_a"},
+                           "sensor_a/temp", "sensor_a"), false, "NOLOCAL should drop self-published messages");
+  eq(mbSubscriptionMatches({filter:"#", source:null, nolocal:true, nodeName:"sensor_a"},
+                           "sensor_a/temp", "sensor_b"), true, "NOLOCAL should keep other publishers' messages");
+
+  runSelfTest.checks = checks;
+  return fails;
+}
+
+/* ===== END PURE-LOGIC ===== */
+
+window.mbSelfTest = function(){
+  const fails = runSelfTest();
+  if (fails.length) console.error("[message-bus-designer self-test] " + fails.length + " FAILURE(S)\n" + fails.join("\n"));
+  else console.log("[message-bus-designer self-test] topic rules OK (" + runSelfTest.checks + " checks)");
+  return fails;
+};
+
+/* ==========================================================================
+ * 1. 数据模型
+ * ========================================================================== */
+
+const SCHEMA_VERSION = "1.1.0";
+const STORAGE_KEY = "message-bus-designer";
+const SAMPLE_KEY  = "message-bus-designer:last-sample";
+
+let uidCounter = 0;
+const uid = (p) => `${p}-${Date.now().toString(36)}-${(uidCounter++).toString(36)}`;
+
+function newBus(name){
+  return { id: uid("bus"), name: name || "", comment: "", nodeEvents: true, nodes: [], edges: [] };
+}
+function newNode(name){
+  return { id: uid("nd"), name: name || "", comment: "", x: null, y: null, publishes: [], subscribes: [] };
+}
+function newPublish(){ return { id: uid("pb"), topic: "", payload: "", retain: false, to: "", comment: "" }; }
+function newSubscribe(){ return { id: uid("sb"), filter: "", source: "", nolocal: false, skipRetained: false, comment: "" }; }
+
+function emptyDoc(){
+  return { version: SCHEMA_VERSION, title: "", comment: "", buses: [] };
+}
+
+let doc = emptyDoc();
+
+/* 当前视图 / 选中项 / 文件句柄 */
+let currentView = "table";
+let selectedNodeId = null;
+let fileHandle = null;         /* File System Access API 的文件句柄（如果浏览器支持） */
+let lastSavedHash = "";
+
+/* ── 查找 ─────────────────────────────────────────────────────────────── */
+function findBus(id){ return doc.buses.find(b => b.id === id) || null; }
+function findNode(id){
+  for (const b of doc.buses){
+    const n = b.nodes.find(n => n.id === id);
+    if (n) return { bus: b, node: n };
+  }
+  return null;
+}
+
+/* 节点发布到总线上的「最终主题」：定向发布要把目标节点名拼在前面。
+   对应 mb_node.c: mb_node_publish_to() 里的 mb_topic_build(dst, subtopic)。 */
+function effectiveTopic(pub){ return pub.to ? `${pub.to}${MB_SEP}${pub.topic}` : pub.topic; }
+
+/* ── 边的手工样式 ──────────────────────────────────────────────────────
+   节点位置存在 node.x / node.y 上，边的「拖过之后长什么样」同理存在 bus.edges 里。
+   键用**节点名 + 主题**而不是内部 id：XML 里认的就是名字，导出再导入还对得上，
+   而 id 每次导入都会重新生成。
+
+   dx / dy 是相对自动走线的偏移量（null = 没动过，走自动车道）。
+   之所以记偏移而不是记控制点绝对坐标：节点被拖走或重新排版之后，
+   手工调过的那条线应该跟着端点一起走，而不是钉死在原来的绝对位置上。 */
+function edgeKeyOf(from, to, topic){ return `${from}\u0000${to}\u0000${topic}`; }
+
+function findEdgeStyle(bus, from, to, topic){
+  const k = edgeKeyOf(from, to, topic);
+  return (bus.edges || []).find(e => edgeKeyOf(e.from, e.to, e.topic) === k) || null;
+}
+
+function setEdgeStyle(bus, from, to, topic, patch){
+  if (!bus.edges) bus.edges = [];
+  let e = findEdgeStyle(bus, from, to, topic);
+  if (!e){ e = { from, to, topic, dx: null, dy: null, color: "" }; bus.edges.push(e); }
+  Object.assign(e, patch);
+  return e;
+}
+
+/* 现在还真的存在的那些边，按「起点名 + 终点名 + 主题」列出来。
+   直接问 analyze() —— 它是画图和校验共用的同一份结果，另写一套判断
+   迟早会跟界面上看到的对不上。
+
+   用途：节点改名（或删掉重发/重订）之后，旧的 <edge> 条目就对不上任何一条线了。
+   内存里留着（改回去就又生效），但导出时不再写出去 —— 否则那个名字会一直
+   躺在 XML 里，谁也不知道它指的是什么。 */
+function liveEdgeKeys(){
+  const nameById = new Map();
+  for (const b of doc.buses) for (const n of b.nodes) nameById.set(n.id, n.name);
+  const set = new Set();
+  for (const e of analyze().edges){
+    const a = nameById.get(e.pubNodeId), b = nameById.get(e.subNodeId);
+    if (a != null && b != null) set.add(edgeKeyOf(a, b, e.topic));
+  }
+  return set;
+}
+
+/* ==========================================================================
+ * 2. XML 序列化 / 反序列化
+ *    刻意手写序列化而不是用 XMLSerializer —— 输出的缩进和属性省略规则
+ *    完全可控，生成的 XML 适合直接提交进版本库、也方便人读和 diff。
+ * ========================================================================== */
+
+function xmlEsc(s){
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&apos;")
+    .replace(/\r/g, "&#13;").replace(/\n/g, "&#10;").replace(/\t/g, "&#9;");
+}
+/** 追加一个 <comment> 子元素；内容为空则跳过（保持 XML 干净）。 */
+function pushComment(lines, text, pad){
+  if (text == null || String(text).trim() === "") return;
+  lines.push(`${pad}<comment>${xmlEsc(text)}</comment>`);
+}
+
+function docToXml(){
+  const L = [];
+  L.push('<?xml version="1.0" encoding="UTF-8"?>');
+  L.push(`<!-- 由「消息总线设计器」生成；schema 版本 ${SCHEMA_VERSION}，对应 message_bus 1.0.0 -->`);
+  L.push(`<message-bus-design version="${xmlEsc(SCHEMA_VERSION)}">`);
+
+  L.push("  <meta>");
+  if (doc.title) L.push(`    <title>${xmlEsc(doc.title)}</title>`);
+  pushComment(L, doc.comment, "    ");
+  L.push("  </meta>");
+
+  for (const bus of doc.buses){
+    const busAttrs = [`name="${xmlEsc(bus.name)}"`];
+    if (!bus.nodeEvents) busAttrs.push(`node-events="false"`);
+    L.push("");
+    L.push(`  <bus ${busAttrs.join(" ")}>`);
+    pushComment(L, bus.comment, "    ");
+
+    for (const node of bus.nodes){
+      /* 位置是关系图里拖出来的，属于呈现信息，有才写 */
+      const nAttrs = [`name="${xmlEsc(node.name)}"`];
+      if (node.x != null && node.y != null) { nAttrs.push(`x="${Math.round(node.x)}"`, `y="${Math.round(node.y)}"`); }
+      L.push(`    <node ${nAttrs.join(" ")}>`);
+      pushComment(L, node.comment, "      ");
+
+      for (const p of node.publishes){
+        const a = [`topic="${xmlEsc(p.topic)}"`];
+        if (p.payload) a.push(`payload="${xmlEsc(p.payload)}"`);
+        if (p.retain)  a.push(`retain="true"`);
+        if (p.to)      a.push(`to="${xmlEsc(p.to)}"`);
+        if (!p.comment || !p.comment.trim()){
+          L.push(`      <publish ${a.join(" ")}/>`);
+        } else {
+          L.push(`      <publish ${a.join(" ")}>`);
+          pushComment(L, p.comment, "        ");
+          L.push("      </publish>");
+        }
+      }
+
+      for (const s of node.subscribes){
+        const a = [`filter="${xmlEsc(s.filter)}"`];
+        if (s.source)       a.push(`source="${xmlEsc(s.source)}"`);
+        if (s.nolocal)      a.push(`nolocal="true"`);
+        if (s.skipRetained) a.push(`skip-retained="true"`);
+        if (!s.comment || !s.comment.trim()){
+          L.push(`      <subscribe ${a.join(" ")}/>`);
+        } else {
+          L.push(`      <subscribe ${a.join(" ")}>`);
+          pushComment(L, s.comment, "        ");
+          L.push("      </subscribe>");
+        }
+      }
+
+      L.push("    </node>");
+    }
+
+    /* 边的手工样式（拖动过 / 改过颜色的那些）。一个字段都没改过的边不写 ——
+       XML 里只留「人真的动过手」的部分，不然每次导出都会多出一堆噪音。
+       对不上任何一条现存边的条目也不写（多半是节点改过名）。 */
+    const live = (bus.edges || []).length ? liveEdgeKeys() : null;
+    for (const e of (bus.edges || [])){
+      const hasXY = e.dx != null && e.dy != null;
+      if (!hasXY && !e.color) continue;
+      if (live && !live.has(edgeKeyOf(e.from, e.to, e.topic))) continue;
+      const a = [`from="${xmlEsc(e.from)}"`, `to="${xmlEsc(e.to)}"`, `topic="${xmlEsc(e.topic)}"`];
+      if (hasXY)   a.push(`dx="${Math.round(e.dx)}"`, `dy="${Math.round(e.dy)}"`);
+      if (e.color) a.push(`color="${xmlEsc(e.color)}"`);
+      L.push(`    <edge ${a.join(" ")}/>`);
+    }
+    L.push("  </bus>");
+  }
+
+  L.push("");
+  L.push("</message-bus-design>");
+  return L.join("\n") + "\n";
+}
+
+function xmlToDoc(text){
+  const parser = new DOMParser();
+
+  /* 去 BOM 与前导空白。
+     FileReader 读带 BOM 的 UTF-8 文件时会原样带出 U+FEFF，而 XML 声明只有在
+     文档第 1 列才算合法 —— 不清理的话，用户会看到「XML declaration allowed
+     only at the start of the document」这种看不出所以然的报错。
+     这里刻意用 charCodeAt 判断而不是正则里的 \uFEFF 字面量：一个肉眼看不见的
+     字符留在源码里，迟早会被人当成空白删掉，然后问题以另一种面貌回来。 */
+  let raw = String(text == null ? "" : text);
+  if (raw.charCodeAt(0) === 0xFEFF) {
+    raw = raw.slice(1);
+  }
+  raw = raw.replace(/^\s+/, "");
+  if (!raw) throw new Error("内容是空的");
+
+  const xdoc = parser.parseFromString(raw, "application/xml");
+
+  const perr = xdoc.querySelector("parsererror");
+  if (perr){
+    /* 浏览器的原始报错很长，掐出「第 N 行第 M 列：原因」这一句就够了。 */
+    const msg = perr.textContent.replace(/\s+/g, " ").trim();
+    const m = /error on line (\d+) at column (\d+): ([\s\S]*?)(?:Below is a rendering|$)/.exec(msg);
+    throw new Error("XML 解析失败：" + (m ? "第 " + m[1] + " 行第 " + m[2] + " 列：" + m[3].trim()
+                                         : msg.slice(0, 200)));
+  }
+
+  const root = xdoc.documentElement;
+  if (!root || root.nodeName !== "message-bus-design")
+    throw new Error(`根元素必须是 <message-bus-design>，实际是 <${root ? root.nodeName : "?"}>`);
+
+  const out = emptyDoc();
+  out.version = root.getAttribute("version") || SCHEMA_VERSION;
+
+  const meta = childEl(root, "meta");
+  if (meta){
+    const t = childEl(meta, "title"); if (t) out.title = t.textContent;
+    const c = childEl(meta, "comment"); if (c) out.comment = c.textContent;
+  }
+
+  for (const busEl of childrenNamed(root, "bus")){
+    const bus = newBus(busEl.getAttribute("name") || "");
+    bus.nodeEvents = busEl.getAttribute("node-events") !== "false";
+    bus.comment = textOf(childEl(busEl, "comment"));
+
+    for (const nodeEl of childrenNamed(busEl, "node")){
+      const node = newNode(nodeEl.getAttribute("name") || "");
+      node.comment = textOf(childEl(nodeEl, "comment"));
+      const x = nodeEl.getAttribute("x"), y = nodeEl.getAttribute("y");
+      node.x = x != null && x !== "" && !isNaN(+x) ? +x : null;
+      node.y = y != null && y !== "" && !isNaN(+y) ? +y : null;
+
+      for (const pEl of childrenNamed(nodeEl, "publish")){
+        const p = newPublish();
+        p.topic   = pEl.getAttribute("topic") || "";
+        p.payload = pEl.getAttribute("payload") || "";
+        p.retain  = pEl.getAttribute("retain") === "true";
+        p.to      = pEl.getAttribute("to") || "";
+        p.comment = textOf(childEl(pEl, "comment"));
+        node.publishes.push(p);
+      }
+      for (const sEl of childrenNamed(nodeEl, "subscribe")){
+        const s = newSubscribe();
+        s.filter       = sEl.getAttribute("filter") || "";
+        s.source       = sEl.getAttribute("source") || "";
+        s.nolocal      = sEl.getAttribute("nolocal") === "true";
+        s.skipRetained = sEl.getAttribute("skip-retained") === "true";
+        s.comment      = textOf(childEl(sEl, "comment"));
+        node.subscribes.push(s);
+      }
+      bus.nodes.push(node);
+    }
+
+    /* 边的手工样式。<edge> 是 <bus> 的直接子元素，和 <node> 平级 ——
+       老版本的读取器只认它认识的子元素，看到 <edge> 会直接忽略，所以能安全混用。 */
+    for (const eEl of childrenNamed(busEl, "edge")){
+      const from = eEl.getAttribute("from") || "", to = eEl.getAttribute("to") || "";
+      const topic = eEl.getAttribute("topic") || "";
+      if (!from || !to || !topic) continue;      /* 缺字段的条目没有意义，跳过而不是报错 */
+      const dx = eEl.getAttribute("dx"), dy = eEl.getAttribute("dy");
+      const color = normColor(eEl.getAttribute("color"));
+      /* dx / dy 当成一对：只写了一个说明文件被人手改坏了，宁可不认也不猜。 */
+      const okXY = dx != null && dy != null && dx !== "" && dy !== "" && !isNaN(+dx) && !isNaN(+dy);
+      if (!okXY && !color) continue;
+      bus.edges.push({
+        from, to, topic,
+        dx: okXY ? +dx : null,
+        dy: okXY ? +dy : null,
+        color
+      });
+    }
+    out.buses.push(bus);
+  }
+  return out;
+}
+
+/* 只认直接子元素 —— querySelector 会连孙子一起选，这里必须精确。 */
+function childrenNamed(parent, name){
+  const out = [];
+  for (const c of parent.children) if (c.nodeName === name) out.push(c);
+  return out;
+}
+function childEl(parent, name){ return childrenNamed(parent, name)[0] || null; }
+function textOf(el){ return el ? el.textContent : ""; }
+
+/* ==========================================================================
+ * 3. 一致性校验（与 C 实现的口径逐条对齐）
+ * ========================================================================== */
+
+/**
+ * 返回 { edges, nodeInfo, pubInfo, issues }。
+ * edges 是「一条发布真的会投递到一条订阅」的连线，图标视图和校验共用。
+ */
+function analyze(){
+  const issues = [];
+  const push = (level, msg, where, busId, nodeId) => issues.push({ level, msg, where, busId, nodeId });
+
+  const edges = [];            /* {pubNodeId, subNodeId, topic, filter, source, sys} */
+  const busNames = new Map();  /* 总线名 -> 出现次数 */
+
+  for (const bus of doc.buses){
+    const busTag = bus.name || "(未命名总线)";
+    const nodeNames = new Map();
+
+    if (!bus.name.trim()) push("error", "总线名称为空 —— <code>mb_bus_create()</code> 会返回 <code>MB_ERR_INVALID_ARG</code>", busTag, bus.id, null);
+    busNames.set(bus.name, (busNames.get(bus.name) || 0) + 1);
+
+    for (const node of bus.nodes){
+      const where = `${busTag} / ${node.name || "(未命名节点)"}`;
+      const nameErr = mbValidateNodeName(node.name);
+      if (nameErr) push("error", `节点名非法：${nameErr}`, where, bus.id, node.id);
+      else nodeNames.set(node.name, (nodeNames.get(node.name) || 0) + 1);
+
+      /* ── 发布侧校验 ── */
+      const seenTopics = new Map();
+      for (const p of node.publishes){
+        const eff = effectiveTopic(p);
+        const pw = `${where} → publish`;
+
+        if (p.to){
+          const toErr = mbValidateNodeName(p.to);
+          if (toErr) push("error", `定向发布的目标节点名非法：${toErr}`, pw, bus.id, node.id);
+          else if (!bus.nodes.some(n => n.name === p.to))
+            push("warn", `定向发布目标节点 <code>${esc(p.to)}</code> 在本总线中不存在 —— 对应 <code>mb_node_publish_to()</code> 不要求目标存在，但消息会落空`, pw, bus.id, node.id);
+        }
+
+        const tErr = mbTopicValidateTopic(eff);
+        if (tErr) push("error", tErr, pw, bus.id, node.id);
+        else if (mbTopicIsSystem(eff))
+          push("warn", `发布主题 <code>${esc(eff)}</code> 以 '$' 开头：按 MQTT 规则，它<strong>不会</strong>被以 <code>#</code> 或 <code>+</code> 开头的过滤器匹配，订阅者必须显式写出 <code>$…</code>`, pw, bus.id, node.id);
+
+        if (seenTopics.has(eff) && !tErr)
+          push("warn", `同一节点重复发布主题 <code>${esc(eff)}</code>（两条发布定义完全等价，留一条即可）`, pw, bus.id, node.id);
+        seenTopics.set(eff, true);
+      }
+
+      /* ── 订阅侧校验 ── */
+      const seenSubs = new Set();
+      for (const s of node.subscribes){
+        const sw = `${where} → subscribe`;
+        const fErr = mbTopicValidateFilter(s.filter);
+        if (fErr) push("error", `过滤器非法：${fErr}`, sw, bus.id, node.id);
+
+        if (s.source){
+          const sErr = mbTopicValidateFilter(s.source);
+          if (sErr) push("error", `来源过滤器非法：${sErr}`, sw, bus.id, node.id);
+          else if (!bus.nodes.some(n => n.name === s.source))
+            push("info", `来源过滤器 <code>${esc(s.source)}</code> 指向的节点不在本总线内 —— 若它确实来自别处则属正常，否则是拼写错误`, sw, bus.id, node.id);
+        }
+
+        if (s.skipRetained && !mbTopicIsSystem(s.filter))
+          push("info", `设置了「不接收 retained」，但本设计里没有向匹配该过滤器的主题发过 retained 消息，此项当前无影响`, sw, bus.id, node.id);
+
+        const sig = `${s.filter}\u0000${s.source}\u0000${s.nolocal ? 1 : 0}\u0000${s.skipRetained ? 1 : 0}`;
+        if (seenSubs.has(sig)) push("warn", `同一节点存在完全重复的订阅 <code>${esc(s.filter)}</code>（过滤器、来源、标志全同），该节点会收到两次同样的消息`, sw, bus.id, node.id);
+        seenSubs.add(sig);
+
+        /* [MQTT-4.7.2-1] 首层通配符收不到系统主题 */
+        if ((s.filter[0] === MB_WILD_MANY || s.filter[0] === MB_WILD_ONE) && bus.nodeEvents)
+          push("info", `过滤器 <code>${esc(s.filter)}</code> 以首层通配符开头，收不到 <code>$mb/…</code> 节点事件；要收请显式写 <code>$mb/nodes/+/connected</code>`, sw, bus.id, node.id);
+      }
+
+      if (node.publishes.length === 0 && node.subscribes.length === 0)
+        push("info", "该节点既没有发布也没有订阅（空节点）", where, bus.id, node.id);
+    }
+
+    /* 重名检查 */
+    for (const [name, n] of nodeNames)
+      if (n > 1) push("error", `总线内节点重名：<code>${esc(name)}</code> 出现 ${n} 次 —— <code>mb_node_create()</code> 会返回 <code>MB_ERR_ALREADY_EXISTS</code>`, busTag, bus.id, null);
+  }
+
+  /* 总线重名 */
+  for (const [name, n] of busNames)
+    if (n > 1 && name.trim()) push("error", `总线重名：<code>${esc(name)}</code> 出现 ${n} 次（多条同名总线彼此独立，但容易混淆）`, name, null, null);
+
+  /* ── 计算投递边 ── */
+  for (const bus of doc.buses){
+    const busTag = bus.name || "(未命名总线)";
+
+    /* 系统事件主题：bus.nodeEvents 打开时，每个节点会自动产生
+         $mb/nodes/<name>/connected   (retained, payload = 节点名)
+         $mb/nodes/<name>/disconnected (非 retained)
+       对应 mb_bus.c: mb_bus_publish_node_event()，source = NULL。 */
+    const sysPubs = [];
+    if (bus.nodeEvents){
+      for (const n of bus.nodes){
+        if (!n.name || mbValidateNodeName(n.name)) continue;
+        sysPubs.push({ busId: bus.id, nodeId: null, topic: `${MB_EVENT_PREFIX}${n.name}/connected`, system: true });
+        sysPubs.push({ busId: bus.id, nodeId: null, topic: `${MB_EVENT_PREFIX}${n.name}/disconnected`, system: true });
+      }
+    }
+
+    const allPubs = [];
+    for (const n of bus.nodes)
+      for (const p of n.publishes){
+        const eff = effectiveTopic(p);
+        if (mbTopicValidateTopic(eff)) continue;   /* 非法的已经在上面报过 */
+        allPubs.push({ busId: bus.id, nodeId: n.id, nodeName: n.name, pub: p, topic: eff, system: false });
+      }
+    for (const sp of sysPubs) allPubs.push({ ...sp, nodeName: null, pub: null });
+
+    const hitCount = new Map();     /* `${nodeId}\u0000${pubId}`  -> 这条发布命中了几条订阅 */
+    const subHitCount = new Map();  /* `${nodeId}\u0000${subId}`  -> 这条订阅能收到几条发布 */
+    const topicOwners = new Map();  /* topic -> Set(发布它的节点名) */
+
+    for (const pub of allPubs){
+      for (const subNode of bus.nodes){
+        for (const s of subNode.subscribes){
+          if (mbTopicValidateFilter(s.filter)) continue;
+          if (s.source && mbTopicValidateFilter(s.source)) continue;
+
+          /* 系统主题的 source 是 NULL：来源过滤永远不命中，NOLOCAL 也管不到 */
+          const source = pub.system ? null : pub.nodeName;
+          const probe = { filter: s.filter, source: s.source, nolocal: s.nolocal, nodeName: subNode.name };
+
+          if (!mbSubscriptionMatches(probe, pub.topic, source)) continue;
+
+          edges.push({
+            busId: bus.id, pubNodeId: pub.nodeId, subNodeId: subNode.id,
+            topic: pub.topic, filter: s.filter, source: s.source, system: pub.system,
+            retained: pub.pub ? pub.pub.retain : true
+          });
+
+          if (!pub.system){
+            const k = `${pub.nodeId}\u0000${pub.pub.id}`;
+            hitCount.set(k, (hitCount.get(k) || 0) + 1);
+          }
+          const sk = `${subNode.id}\u0000${s.id}`;
+          subHitCount.set(sk, (subHitCount.get(sk) || 0) + 1);
+        }
+      }
+    }
+
+    /* 同一个主题被多个节点发布：订阅者会交替收到两边的内容 */
+    for (const pub of allPubs){
+      if (pub.system) continue;
+      if (!topicOwners.has(pub.topic)) topicOwners.set(pub.topic, new Set());
+      topicOwners.get(pub.topic).add(pub.nodeName);
+    }
+    for (const [topic, owners] of topicOwners){
+      if (owners.size < 2) continue;
+      push("warn", `主题 <code>${esc(topic)}</code> 被 ${owners.size} 个节点发布（${Array.from(owners).map(esc).join("、")}）—— ` +
+                   `订阅者会交替收到两边的内容，界面可能来回跳变；真要这么做，建议约定好各自的子主题`, busTag, bus.id, null);
+    }
+
+    /* 一条发布也收不到的订阅：多半是笔误，或者关系还没画完 */
+    for (const n of bus.nodes){
+      for (const s of n.subscribes){
+        if (mbTopicValidateFilter(s.filter)) continue;
+        if (s.source && mbTopicValidateFilter(s.source)) continue;
+        if (subHitCount.get(`${n.id}\u0000${s.id}`)) continue;
+        push("warn", `过滤器 <code>${esc(s.filter)}</code> 匹配不到本总线上的任何发布 —— 要么是拼写错了，` +
+                     `要么它在等一个还没画上来的节点（对应 <code>stats.no_subscriber</code> 之外的另一半问题）`,
+             `${busTag} / ${n.name} → subscribe`, bus.id, n.id);
+      }
+    }
+
+    /* 没人订阅的发布 = stats.no_subscriber 的来源 */
+    for (const pub of allPubs){
+      if (pub.system) continue;
+      const k = `${pub.nodeId}\u0000${pub.pub.id}`;
+      if (!hitCount.get(k)){
+        const node = bus.nodes.find(n => n.id === pub.nodeId);
+        push("warn", `主题 <code>${esc(pub.topic)}</code> 没有任何订阅者匹配 —— 发出去只会让 <code>stats.no_subscriber</code> 加一`, `${busTag} / ${node ? node.name : "?"} → publish`, bus.id, pub.nodeId);
+      }
+    }
+
+    /* 自我投递检查：节点订阅了自己发布的主题且没设 NOLOCAL */
+    for (const n of bus.nodes){
+      for (const p of n.publishes){
+        const eff = effectiveTopic(p);
+        if (mbTopicValidateTopic(eff)) continue;
+        for (const s of n.subscribes){
+          if (mbTopicValidateFilter(s.filter)) continue;
+          if (s.nolocal) continue;
+          if (!mbTopicMatch(s.filter, eff)) continue;
+          push("info", `节点订阅了自己发布的 <code>${esc(eff)}</code> 且未设 NOLOCAL —— 回调会在自己的线程里被再调用一次（改造成「转发器」时通常要加 NOLOCAL）`, `${busTag} / ${n.name}`, bus.id, n.id);
+          break;
+        }
+      }
+    }
+  }
+
+  return { edges, issues };
+}
+
+/* ==========================================================================
+ * 4. C 代码生成：把某个节点/总线的实际配置拼成可对照的 C 片段
+ *
+ *    生成的是**参考片段**，不是让你照单全收：变量名取自节点名、回调是空壳、
+ *    payload 只是示例值。目的是让「这份配置落到代码里长什么样」一眼可见。
+ *
+ *    这里只用 mb_* 公开 API，调用签名与 include/message_bus/*.h 逐字对齐 ——
+ *    生成一段编不过的代码，比不生成更糟。
+ * ========================================================================== */
+
+/* 纯界面状态，不进 XML：哪些节点/总线正展开着代码。 */
+const codeOpen    = new Set();
+const busCodeOpen = new Set();
+/* key -> 上次生成的文本。留着它是为了 diff 出「这次多了哪几行」，
+   好让新增的代码闪一下背景。 */
+const codeCache   = new Map();
+
+const C_KEYWORDS = new Set([
+  "auto","break","case","char","const","continue","default","do","double","else","enum",
+  "extern","float","for","goto","if","inline","int","long","register","restrict","return",
+  "short","signed","sizeof","static","struct","switch","typedef","union","unsigned","void",
+  "volatile","while","bool","true","false","NULL"]);
+
+/* 节点名 → C 标识符。名字里允许出现 '-'、'.'、中文等，都得换掉；
+   整串都换没了（例如全中文节点名）时退回调用方给的 fallback。 */
+function cIdent(name, fallback){
+  let s = String(name == null ? "" : name).replace(/[^A-Za-z0-9_]/g, "_");
+  if (/^[0-9]/.test(s)) s = "n_" + s;
+  if (/^_*$/.test(s) || C_KEYWORDS.has(s)) s = "";
+  return s || fallback;
+}
+
+function cStr(s){
+  return '"' + String(s == null ? "" : s)
+    .replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t") + '"';
+}
+
+/* C 字符串字面量在源码里是 UTF-8 字节，长度不能直接用 JS 的 .length ——
+   一个中文字符 JS 算 1、C 里是 3 字节，生成的 payload_len 会错。 */
+function utf8Len(s){
+  let n = 0;
+  for (let i = 0; i < s.length; i++){
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length){ n += 4; i++; }  /* 代理对 */
+    else n += 3;
+  }
+  return n;
+}
+
+/* 过滤器 → 回调函数名，带上节点名以保证唯一：
+       motor   订阅 motor/cmd        → on_motor_cmd
+       lvgl_ui 订阅 sensor/+/value   → on_lvgl_ui_sensor_value
+
+   为什么要带节点名：光用过滤器的话，两个节点订阅同一个主题就会生成两个
+   同名函数，拼到一个文件里直接重定义。带上前缀后，每个节点的名字只由它
+   自己的配置决定（不依赖别的节点），所以改 A 节点的配置不会波及 B 节点。 */
+function handlerName(nodeIdent, filter, used){
+  let f = String(filter == null ? "" : filter).replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  /* 过滤器首层通常就是节点名自己，去掉免得出现 on_motor_motor_cmd */
+  if (f === nodeIdent) f = "";
+  else if (f.indexOf(nodeIdent + "_") === 0) f = f.slice(nodeIdent.length + 1);
+  if (!f) f = "msg";
+  if (/^[0-9]/.test(f)) f = "t_" + f;
+  const base = "on_" + nodeIdent + "_" + f;
+  let h = base, n = 2;
+  while (used.has(h)) h = base + "_" + (n++);
+  used.add(h);
+  return h;
+}
+
+/* 多行注释压成一行，免得把后面那条语句挤到注释里面去 */
+function oneLine(s){ return String(s == null ? "" : s).replace(/\s*\n\s*/g, " ").trim(); }
+
+/* ── 总线级别：建总线 + 销毁总线 ───────────────────────────────────── */
+function busCodeLines(bus){
+  const L = [];
+  if (bus.comment) for (const ln of bus.comment.split("\n")) L.push("/* " + ln + " */");
+  L.push("mb_bus_t *bus = NULL;");
+  if (bus.nodeEvents){
+    L.push(`mb_bus_create(${cStr(bus.name)}, &bus);   /* publish_node_events 默认 true */`);
+  } else {
+    /* 关掉事件就得走 _ex 形式 —— mb_bus_create() 用的是默认配置，改不了 */
+    L.push("mb_bus_config_t bus_cfg;");
+    L.push("mb_bus_default_config(&bus_cfg);");
+    L.push("bus_cfg.publish_node_events = false;");
+    L.push(`mb_bus_create_ex(${cStr(bus.name)}, &bus_cfg, &bus);`);
+  }
+  L.push("");
+  L.push("/* 各节点的创建见各自的代码块 */");
+  L.push("");
+  L.push("mb_bus_destroy(bus);   /* 级联销毁全部节点、订阅与 retained */");
+  return L;
+}
+
+/* ── 节点级别：建节点 + 发布 + 订阅 + 回调空壳 ─────────────────────── */
+function nodeCodeLines(bus, node){
+  const L = [];
+  /* 名字洗不出标识符时（例如整串中文）退回 node_N。用节点在总线里的序号而不是
+     固定 "node"，否则同一条总线上两个中文名节点会生成同名变量。 */
+  const v = cIdent(node.name, "node_" + (bus.nodes.indexOf(node) + 1));
+  const used = new Set();
+
+  if (node.comment) for (const ln of node.comment.split("\n")) L.push("/* " + ln + " */");
+  L.push(`mb_node_t *${v} = NULL;`);
+  L.push(`mb_node_create(bus, ${cStr(node.name)}, &${v});`);
+
+  if (node.publishes.length){
+    L.push("");
+    L.push("/* 发布 */");
+    node.publishes.forEach((p, i) => {
+      const optsVar = `${v}_pub${i}`;
+      let optsArg = "NULL";
+      if (p.retain){   /* flags 为 0 时直接传 NULL，省掉一个变量 */
+        L.push(`mb_publish_opts_t ${optsVar} = { .flags = MB_PUB_FLAG_RETAIN, .qos = 0 };`);
+        optsArg = `&${optsVar}`;
+      }
+      const payload = (p.payload == null || p.payload === "")
+        ? "NULL, 0"
+        : `${cStr(p.payload)}, ${utf8Len(p.payload)}`;
+      if (p.comment) L.push(`/* ${oneLine(p.comment)} */`);
+      if (p.to){
+        /* 定向发布：主题栏里存的是子主题，目标节点单独一个参数 */
+        const sub = p.topic ? cStr(p.topic) : "NULL";
+        L.push(`mb_node_publish_to(${v}, ${cStr(p.to)}, ${sub}, ${payload}, ${optsArg});`);
+      } else {
+        L.push(`mb_node_publish(${v}, ${cStr(p.topic)}, ${payload}, ${optsArg});`);
+      }
+    });
+  }
+
+  if (node.subscribes.length){
+    L.push("");
+    L.push("/* 订阅 */");
+    const handlers = [];
+    node.subscribes.forEach((s, i) => {
+      const h = handlerName(v, s.filter, used);
+      handlers.push(h);
+      if (s.comment) L.push(`/* ${oneLine(s.comment)} */`);
+      const needOpts = !!(s.source || s.nolocal || s.skipRetained);
+      if (!needOpts){
+        L.push(`mb_node_subscribe(${v}, ${cStr(s.filter)}, ${h}, NULL, NULL);`);
+      } else {
+        /* source_filter / 标志位只有 _ex 形式能表达 */
+        const o = `${v}_sub${i}`;
+        const flags = [s.nolocal && "MB_SUB_FLAG_NOLOCAL",
+                       s.skipRetained && "MB_SUB_FLAG_SKIP_RETAINED"]
+                      .filter(Boolean).join(" | ") || "0";
+        L.push(`mb_subscribe_opts_t ${o} = {`);
+        L.push(`    .filter        = ${cStr(s.filter)},`);
+        L.push(`    .source_filter = ${s.source ? cStr(s.source) : "NULL"},`);
+        L.push(`    .flags         = ${flags},`);
+        L.push(`    .user_data     = NULL,`);
+        L.push("};");
+        L.push(`mb_node_subscribe_ex(${v}, &${o}, ${h}, NULL);`);
+      }
+    });
+
+    L.push("");
+    L.push("/* 回调：同步跑在发布者的线程里 —— 别做耗时操作，也别直接碰 LVGL 控件 */");
+    handlers.forEach((h, i) => {
+      if (i) L.push("");
+      L.push(`static void ${h}(mb_subscription_t *sub, const mb_message_t *msg, void *user_data)`);
+      L.push("{");
+      L.push("    (void)sub; (void)user_data;");
+      L.push('    printf("%s = %.*s\\n", msg->topic, (int)msg->payload_len, (const char *)msg->payload);');
+      L.push("}");
+    });
+  }
+
+  return L;
+}
+
+/* 行级 diff：返回 newLines 里「不在最长公共子序列上」的下标 ——
+   也就是新增或被改动的行。朴素 LCS 足够：单个节点撑死几十行。 */
+function addedLineIndices(oldLines, newLines){
+  const n = oldLines.length, m = newLines.length;
+  const dp = [];
+  for (let i = 0; i <= n; i++) dp.push(new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--)
+    for (let j = m - 1; j >= 0; j--)
+      dp[i][j] = oldLines[i] === newLines[j] ? dp[i + 1][j + 1] + 1
+                                             : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const out = [];
+  let i = 0, j = 0;
+  while (i < n && j < m){
+    if (oldLines[i] === newLines[j]){ i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) i++;
+    else out.push(j++);
+  }
+  while (j < m) out.push(j++);
+  return out;
+}
+
+/* ── C 语法着色 ──────────────────────────────────────────────────────
+   逐行扫描，不需要跨行状态机：生成的代码里注释和字符串都收在一行内
+   （多行注释在生成时就被拆成了每行一段、各自闭合）。返回 HTML，
+   普通文本一律走 esc()。这里只负责上色，不改动任何字符 —— textContent
+   必须和输入逐字相等，否则「复制代码」和行级 diff 都会跟着错。 */
+const C_TYPES = new Set([
+  "void","char","int","short","long","float","double","signed","unsigned",
+  "size_t","ssize_t","bool","_Bool","auto","register","static","extern","const",
+  "volatile","inline","struct","union","enum","typedef",
+  "uint8_t","uint16_t","uint32_t","uint64_t","int8_t","int16_t","int32_t","int64_t"]);
+
+function hlC(line){
+  let out = "", i = 0;
+  const n = line.length;
+  while (i < n){
+    const c = line[i];
+
+    /* 注释 —— 先于除法判断，否则 "/" 会被当成普通字符 */
+    if (c === "/" && line[i + 1] === "*"){
+      const e = line.indexOf("*/", i + 2);
+      const stop = e < 0 ? n : e + 2;
+      out += `<span class="c-cm">${esc(line.slice(i, stop))}</span>`;
+      i = stop; continue;
+    }
+    if (c === "/" && line[i + 1] === "/"){
+      out += `<span class="c-cm">${esc(line.slice(i))}</span>`;
+      break;
+    }
+
+    /* 字符串 / 字符字面量：\" 和 \\ 不算结束，扫的时候要跳过转义对 */
+    if (c === '"' || c === "'"){
+      let j = i + 1;
+      while (j < n){
+        if (line[j] === "\\"){ j += 2; continue; }
+        if (line[j] === c){ j++; break; }
+        j++;
+      }
+      out += `<span class="c-st">${esc(line.slice(i, j))}</span>`;
+      i = j; continue;
+    }
+
+    /* 预处理指令：只认「本行第一个非空白字符是 #」的情况 */
+    if (c === "#" && !line.slice(0, i).trim()){
+      out += `<span class="c-pp">${esc(line.slice(i))}</span>`;
+      break;
+    }
+
+    /* 数字：前面不能紧跟标识符字符，免得把 foo2 里的 2 抠出来 */
+    if (c >= "0" && c <= "9" && !/[A-Za-z0-9_]/.test(line[i - 1] || "")){
+      const m = /^(0[xX][0-9a-fA-F]+|[0-9]+(?:\.[0-9]*)?)([uUlLfF]*)/.exec(line.slice(i));
+      out += `<span class="c-nu">${esc(m[0])}</span>`;
+      i += m[0].length; continue;
+    }
+
+    /* 标识符：类型 → 常量 → 关键字 → 函数名 → 普通名字 */
+    if (/[A-Za-z_]/.test(c)){
+      const w = /^[A-Za-z_][A-Za-z0-9_]*/.exec(line.slice(i))[0];
+      let cls = "";
+      if (C_TYPES.has(w) || /_t$/.test(w))              cls = "c-ty";
+      else if (/^[A-Z][A-Z0-9_]*$/.test(w))             cls = "c-mc";   /* MB_PUB_FLAG_RETAIN、NULL… */
+      else if (C_KEYWORDS.has(w))                       cls = "c-kw";
+      else if (/^\s*\(/.test(line.slice(i + w.length))) cls = "c-fn";
+      out += cls ? `<span class="${cls}">${esc(w)}</span>` : esc(w);
+      i += w.length; continue;
+    }
+
+    out += esc(c); i++;
+  }
+  return out;
+}
+
+/* 把代码写进对应的 <pre>。flash 为真时，相对上次新增的行加 .flash 闪一下背景。
+   首次生成（缓存里还没有）不闪 —— 否则一展开就是满屏高亮。 */
+function renderCodeBlock(key, lines, flash){
+  const el = document.querySelector(`[data-code-for="${CSS.escape(key)}"]`);
+  if (!el) return;
+  const prev  = codeCache.get(key);
+  const added = (flash && prev != null)
+    ? new Set(addedLineIndices(prev.split("\n"), lines)) : new Set();
+
+  /* 重写 innerHTML 会把 <pre> 自己的滚动位置弹回顶部。改动多行的代码块时，
+     你正看着下半截，一改就被拽回开头，闪的那一行刚好在视野外 ——
+     看上去就是「改了设置，代码没高亮」。所以先记住、写完再还原。 */
+  const st = el.scrollTop, sl = el.scrollLeft;
+  el.innerHTML = lines.map((ln, i) =>
+    `<span class="cl${added.has(i) ? " flash" : ""}">${hlC(ln)}</span>`).join("\n");
+  el.scrollTop = st; el.scrollLeft = sl;
+  codeCache.set(key, lines.join("\n"));
+
+  /* 闪的行若在可视区外，只滚这个 <pre>（不动外层页面 —— 否则你正在打字的
+     输入框会被滚出屏幕）。
+     用 getBoundingClientRect 算相对位置，不能用 offsetTop —— offsetTop 是
+     相对最近的有定位祖先算的，不是相对 <pre>，拿它跟 scrollTop 比会把
+     本来就在视野里的行误判成「在下面」，于是每改一次就往下滚一截。 */
+  if (added.size){
+    const first = el.querySelector(".cl.flash");
+    if (first && first.offsetHeight){
+      const pr = el.getBoundingClientRect(), fr = first.getBoundingClientRect();
+      if (fr.top < pr.top)         el.scrollTop += fr.top - pr.top;
+      else if (fr.bottom > pr.bottom) el.scrollTop += fr.bottom - pr.bottom;
+    }
+    /* 万一动画被系统设置（prefers-reduced-motion）或别的样式关掉了，
+       animationend 永远不会来，.flash 就会永久留在一行上。兜个底。 */
+    clearTimeout(el._flashTimer);
+    el._flashTimer = setTimeout(() => {
+      for (const s of el.querySelectorAll(".cl.flash")) s.classList.remove("flash");
+    }, 2200);
+  }
+}
+
+/* 闪完就把 .flash 摘掉，让「回归正常」是显式发生的，而不是靠 CSS 动画的
+   默认 fill-mode。这样即便以后有人给动画加上 fill-mode: forwards，
+   也不会留下一条永远高亮的行。 */
+document.addEventListener("animationend", (ev) => {
+  const el = ev.target;
+  if (el && el.classList && el.classList.contains("flash")) el.classList.remove("flash");
+}, true);
+
+/* 重绘所有「已展开」的代码块。结构性改动（增删行列）走 commit() 会整树重建，
+   所以由这里补上内容，顺带把新增的行闪一下。 */
+function refreshAllCode(flash){
+  for (const bus of doc.buses){
+    if (busCodeOpen.has(bus.id)) renderCodeBlock(bus.id, busCodeLines(bus), flash);
+    for (const node of bus.nodes)
+      if (codeOpen.has(node.id)) renderCodeBlock(node.id, nodeCodeLines(bus, node), flash);
+  }
+}
+
+/* ==========================================================================
+ * 5. 渲染：表格视图
+ * ========================================================================== */
+
+function esc(s){
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function renderTable(){
+  const host = document.getElementById("view-table");
+  if (doc.buses.length === 0){
+    host.innerHTML = `<div class="vnone" style="padding:40px">
+      还没有任何总线。<br><br>
+      <button class="primary" data-act="add-bus">+ 新建第一条总线</button>
+      &nbsp;或&nbsp;<button data-act="load-sample">载入示例</button>
+    </div>`;
+    return;
+  }
+
+  let html = "";
+  for (const bus of doc.buses){
+    html += `<section class="bus-block" id="bus-${esc(bus.id)}">
+      <header class="bus-head">
+        <span style="color:var(--accent); font-family:var(--mono); font-size:12px">bus</span>
+        <input class="bus-name" data-field="bus-name" data-bus="${esc(bus.id)}"
+               value="${esc(bus.name)}" placeholder="总线名（mb_bus_create 的 name）">
+        <label title="对应 mb_bus_create_ex() 的 mb_bus_config_t.publish_node_events">
+          <input type="checkbox" data-field="bus-nodeevents" data-bus="${esc(bus.id)}" ${bus.nodeEvents ? "checked" : ""}>
+          发布节点上线/下线事件
+        </label>
+        <input class="bus-comment" data-field="bus-comment" data-bus="${esc(bus.id)}"
+               value="${esc(bus.comment)}" placeholder="这条总线负责什么…">
+        <button class="tiny" data-act="toggle-bus-code" data-bus="${esc(bus.id)}"
+                title="按当前配置生成这条总线的 C 代码">${busCodeOpen.has(bus.id) ? "隐藏代码" : "C 代码"}</button>
+        <button class="tiny" data-act="add-node" data-bus="${esc(bus.id)}">+ 节点</button>
+        <button class="tiny danger" data-act="del-bus" data-bus="${esc(bus.id)}">删除总线</button>
+      </header>`;
+
+    if (busCodeOpen.has(bus.id))
+      html += `<pre class="code" data-code-for="${esc(bus.id)}"></pre>`;
+
+    if (bus.nodes.length === 0){
+      html += `<div class="hint">这条总线上还没有节点。<button class="tiny" data-act="add-node" data-bus="${esc(bus.id)}">+ 添加第一个节点</button></div>`;
+    }
+
+    for (const node of bus.nodes){
+      html += renderNodeCard(bus, node);
+    }
+    html += `</section>`;
+  }
+  host.innerHTML = html;
+
+  /* 卡片是整段重建的，展开着的代码块得重新填一次。
+     传 true：结构性改动（加一条发布、加一个订阅）新增的行会闪一下背景；
+     配置没变时 diff 为空，什么也不会闪。 */
+  refreshAllCode(true);
+}
+
+function renderNodeCard(bus, node){
+  const nid = esc(node.id), bid = esc(bus.id);
+
+  let pubRows = "";
+  node.publishes.forEach((p, i) => {
+    pubRows += `<tr>
+      <td>${p.to ? `<span class="mono" style="color:var(--fg-mute)">${esc(p.to)}/</span>` : ""}<input
+             data-field="pub-topic" data-bus="${bid}" data-node="${nid}" data-idx="${i}"
+             value="${esc(p.topic)}" placeholder="${p.to ? "子主题，如 cmd" : "主题，如 sensor/temp/value"}"></td>
+      <td class="cell-narrow"><input data-field="pub-to" data-bus="${bid}" data-node="${nid}" data-idx="${i}"
+             value="${esc(p.to)}" placeholder="—" title="定向发布目标节点名；留空表示普通发布"></td>
+      <td><input data-field="pub-payload" data-bus="${bid}" data-node="${nid}" data-idx="${i}"
+             value="${esc(p.payload)}" placeholder="示例负载（仅文档用）"></td>
+      <td class="cell-narrow c"><input type="checkbox" data-field="pub-retain" data-bus="${bid}" data-node="${nid}" data-idx="${i}"
+             ${p.retain ? "checked" : ""} title="MB_PUB_FLAG_RETAIN：总线上保留最后一条，后订阅者立刻收到"></td>
+      <td><input data-field="pub-comment" data-bus="${bid}" data-node="${nid}" data-idx="${i}"
+             value="${esc(p.comment)}" placeholder="注释…"></td>
+      <td class="cell-act"><button class="tiny danger" data-act="del-pub" data-bus="${bid}" data-node="${nid}" data-idx="${i}">×</button></td>
+    </tr>`;
+  });
+
+  let subRows = "";
+  node.subscribes.forEach((s, i) => {
+    subRows += `<tr>
+      <td><input data-field="sub-filter" data-bus="${bid}" data-node="${nid}" data-idx="${i}"
+             value="${esc(s.filter)}" placeholder="过滤器，可用 + 和 #"></td>
+      <td class="cell-narrow"><input data-field="sub-source" data-bus="${bid}" data-node="${nid}" data-idx="${i}"
+             value="${esc(s.source)}" placeholder="—" title="来源过滤：只收某个节点发出的消息"></td>
+      <td class="cell-narrow c"><input type="checkbox" data-field="sub-nolocal" data-bus="${bid}" data-node="${nid}" data-idx="${i}"
+             ${s.nolocal ? "checked" : ""} title="MB_SUB_FLAG_NOLOCAL：不收自己发出的消息"></td>
+      <td class="cell-narrow c"><input type="checkbox" data-field="sub-skipretained" data-bus="${bid}" data-node="${nid}" data-idx="${i}"
+             ${s.skipRetained ? "checked" : ""} title="MB_SUB_FLAG_SKIP_RETAINED：订阅时不补发已保留的消息"></td>
+      <td><input data-field="sub-comment" data-bus="${bid}" data-node="${nid}" data-idx="${i}"
+             value="${esc(s.comment)}" placeholder="注释…"></td>
+      <td class="cell-act"><button class="tiny danger" data-act="del-sub" data-bus="${bid}" data-node="${nid}" data-idx="${i}">×</button></td>
+    </tr>`;
+  });
+
+  const sel = selectedNodeId === node.id ? " active" : "";
+  return `<article class="node-card${sel}" id="node-${nid}" data-node-card="${nid}">
+    <header>
+      <span style="color:var(--fg-mute); font-family:var(--mono); font-size:12px">node</span>
+      <input class="node-name" data-field="node-name" data-bus="${bid}" data-node="${nid}"
+             value="${esc(node.name)}" placeholder="节点名（唯一，不能含 / + # 或首字符 $）">
+      <span class="badges" data-badges="${nid}"></span>
+      <input class="node-comment" data-field="node-comment" data-bus="${bid}" data-node="${nid}"
+             value="${esc(node.comment)}" placeholder="这个节点负责什么…">
+      <button class="tiny danger" data-act="del-node" data-bus="${bid}" data-node="${nid}">删除节点</button>
+    </header>
+
+    <div class="tbl-cap pub"><span class="t">▸ 发布 publish</span>
+      <button class="tiny" data-act="add-pub" data-bus="${bid}" data-node="${nid}">+ 添加发布</button></div>
+    ${pubRows ? `<table class="grid"><thead><tr>
+        <th>主题 topic</th><th>定向目标</th><th>示例负载</th><th title="MB_PUB_FLAG_RETAIN">retain</th><th>注释</th><th></th>
+      </tr></thead><tbody>${pubRows}</tbody></table>`
+      : `<div class="hint">（无）</div>`}
+
+    <div class="tbl-cap sub"><span class="t">▸ 订阅 subscribe</span>
+      <button class="tiny" data-act="add-sub" data-bus="${bid}" data-node="${nid}">+ 添加订阅</button></div>
+    ${subRows ? `<table class="grid"><thead><tr>
+        <th>过滤器 filter</th><th>来源过滤</th><th title="MB_SUB_FLAG_NOLOCAL">nolocal</th><th title="MB_SUB_FLAG_SKIP_RETAINED">skip-ret</th><th>注释</th><th></th>
+      </tr></thead><tbody>${subRows}</tbody></table>`
+      : `<div class="hint">（无）</div>`}
+
+    <div class="tbl-cap code"><span class="t">▸ C 代码</span>
+      <button class="tiny" data-act="toggle-code" data-node="${nid}"
+              title="按这个节点的当前配置生成 C 代码">${codeOpen.has(node.id) ? "隐藏" : "显示"}</button>
+      <span class="hint" style="padding:0">按当前配置生成，仅供参考</span></div>
+    ${codeOpen.has(node.id) ? `<pre class="code" data-code-for="${nid}"></pre>` : ""}
+  </article>`;
+}
+
+/* 只更新「派生」的显示：徽标、错误高亮、侧栏树、状态栏、校验面板。
+   输入时调用它，避免整棵树重建导致光标丢失。 */
+function refreshDerived(){
+  const { issues } = analyze();
+
+  /* 节点上的错误/警告计数 */
+  for (const bus of doc.buses){
+    for (const node of bus.nodes){
+      const el = document.querySelector(`[data-badges="${CSS.escape(node.id)}"]`);
+      if (!el) continue;
+      const mine = issues.filter(i => i.nodeId === node.id);
+      const nErr = mine.filter(i => i.level === "error").length;
+      const nWarn = mine.filter(i => i.level === "warn").length;
+      el.innerHTML =
+        `<span class="badge pub">pub ${node.publishes.length}</span>` +
+        `<span class="badge sub">sub ${node.subscribes.length}</span>` +
+        (nErr  ? `<span class="badge err">✕ ${nErr}</span>` : "") +
+        (nWarn ? `<span class="badge warn">! ${nWarn}</span>` : "");
+    }
+  }
+
+  /* 把出错的输入框标红 */
+  for (const el of document.querySelectorAll("#view-table input[data-field]")) el.classList.remove("bad");
+  markBadFields();
+
+  renderTree();
+  renderValidation();
+  renderStatus();
+}
+
+function markBadFields(){
+  const bad = (sel, pred) => {
+    for (const el of document.querySelectorAll(`#view-table ${sel}`)){
+      if (pred(el)) el.classList.add("bad");
+    }
+  };
+  bad('input[data-field="bus-name"]', el => {
+    const b = findBus(el.dataset.bus);
+    return !b || !b.name.trim();
+  });
+  bad('input[data-field="node-name"]', el => mbValidateNodeName(el.value) !== null);
+  bad('input[data-field="pub-topic"]',  el => {
+    const r = findNode(el.dataset.node);
+    const p = r && r.node.publishes[+el.dataset.idx];
+    return !p || mbTopicValidateTopic(effectiveTopic(p)) !== null;
+  });
+  bad('input[data-field="pub-to"]', el => {
+    const v = el.value.trim();
+    return v !== "" && mbValidateNodeName(v) !== null;
+  });
+  bad('input[data-field="sub-filter"]', el => mbTopicValidateFilter(el.value) !== null);
+  bad('input[data-field="sub-source"]', el => el.value.trim() !== "" && mbTopicValidateFilter(el.value) !== null);
+}
+
+/* ==========================================================================
+ * 6. 渲染：关系图视图
+ * ========================================================================== */
+
+const NODE_W = 150, NODE_H = 46, COL_GAP = 210, ROW_GAP = 74, PAD = 36;
+
+function renderGraph(){
+  /* 重绘之后面板上记的 key（`总线#序号`）可能已经指向别的东西了，
+     所以每次重绘先收起来。真正还需要它的调用方会在重绘后自己再打开。 */
+  closeEdgePanel();
+
+  const host = document.getElementById("view-graph");
+  if (doc.buses.length === 0){
+    host.innerHTML = `<div class="vnone" style="padding:40px">还没有总线，切到表格视图先建一条。</div>`;
+    return;
+  }
+  let html = "";
+  for (const bus of doc.buses) html += renderBusGraph(bus);
+  html += `<div class="legend">
+    <span><i style="border-color:var(--pub)"></i>投递路径（发布者 → 订阅者，虚线朝目标流动）</span>
+    <span><i style="border-color:var(--accent)"></i>自我投递</span>
+    <span><i style="border-color:var(--fg-mute); border-top-style:dashed"></i>无人订阅</span>
+    <span style="color:var(--fg-mute)">单击方框跳到表格视图；拖动方框调整位置；
+      <b style="color:var(--fg-dim)">拖动线上的标签可改变线的形状，单击可改颜色</b>；
+      Ctrl+滚轮缩放</span>
+    <span class="zoom">
+      <button class="tiny" data-act="zoom-out" title="缩小">−</button>
+      <button class="tiny" data-act="zoom-reset" id="zoom-level" title="恢复 100%">100%</button>
+      <button class="tiny" data-act="zoom-in" title="放大">+</button>
+    </span>
+  </div>`;
+  host.innerHTML = html;
+
+  /* 画布至少铺满可视区。自动排版往往只有一两百像素高，下面那片空白既不是
+     SVG、也收不到鼠标事件 —— 看上去就是「高度太小」，而且没地方把节点拖开。
+     把最后一条总线的画布撑高到填满，这片空白就成了真正能拖的画布。
+
+     算的是画布「应该」有多高，再一次性设成那个值，不加增量 ——
+     写增量的话，面板一滚动 rect 就偏移，每次重绘又多加一截，画布会自己长高。
+
+     注意 host（#view-graph）自身是「按内容撑高」的，它的 clientHeight 永远
+     等于内容高度，拿它当可视区永远算不出该长高。真正滚动的是外层 .pane，
+     所以要量 pane 的可视高度，再从 host 里减掉表头、图例、外边距这些非画布内容。
+     视图隐藏时 pane 高度为 0，want 为负，自然跳过。 */
+  const busEls = host.querySelectorAll(".graph-bus");
+  const last   = busEls.length ? busEls[busEls.length - 1] : null;
+  const scroll = last ? last.querySelector(".graph-scroll") : null;
+  const svg    = scroll ? scroll.querySelector("svg") : null;
+  const pane   = host.closest(".pane") || host;
+  if (svg && scroll){
+    const w   = parseFloat(svg.getAttribute("width"))  || 0;
+    const h   = parseFloat(svg.getAttribute("height")) || 0;
+    const cs  = getComputedStyle(pane);
+    const visible = pane.clientHeight - (parseFloat(cs.paddingTop) || 0)
+                                      - (parseFloat(cs.paddingBottom) || 0);
+    const rest    = host.offsetHeight - h;         /* 同一容器内除画布以外的内容 */
+    const want    = visible - rest;                /* 铺满可视区所需的画布高度 */
+    if (want > 0 && want < 20000){
+      if (want > h + 1){
+        svg.setAttribute("height", want);
+        svg.setAttribute("viewBox", `0 0 ${w} ${want}`);
+      }
+      /* 关键：把「滚动」这件事锁在 .graph-scroll 这一层。
+         .graph-scroll 没有写死高度，高度是按内容（SVG）撑的 —— 于是节点被拖远、
+         SVG 长高之后，滚动条跑到外层 .pane 上，而「拖空白平移」平的是
+         .graph-scroll，纵向就完全拖不动。给它一个上限，SVG 超出多少就在它内部滚多少。 */
+      scroll.style.maxHeight = want + "px";
+    }
+  }
+
+  /* 缩放要在「撑高画布」之后应用 —— 撑高改的是 width/height 属性，
+     而 CSS 尺寸是从这些属性乘出来的，顺序反了就会用旧的逻辑尺寸去算。 */
+  applyGraphZoom();
+}
+
+function renderBusGraph(bus){
+  const busId = bus.id;
+  const nodes = bus.nodes.filter(n => n.name && !mbValidateNodeName(n.name));
+  if (nodes.length === 0)
+    return `<div class="graph-bus"><header><span class="gname">${esc(bus.name || "(未命名总线)")}</span></header>
+            <div class="graph-empty">这条总线上还没有合法命名的节点。</div></div>`;
+
+  /* ── 收集「发布集合」 ── */
+  const pubList = [];   /* {nodeId, topic, pub|null, system} */
+  for (const n of nodes){
+    for (const p of n.publishes){
+      const eff = effectiveTopic(p);
+      if (mbTopicValidateTopic(eff)) continue;
+      pubList.push({ nodeId: n.id, topic: eff, pub: p, system: false });
+    }
+  }
+  if (bus.nodeEvents){
+    for (const n of nodes){
+      pubList.push({ nodeId: n.id, topic: `${MB_EVENT_PREFIX}${n.name}/connected`,    pub: null, system: true, virtual: true });
+      pubList.push({ nodeId: n.id, topic: `${MB_EVENT_PREFIX}${n.name}/disconnected`, pub: null, system: true, virtual: true });
+    }
+  }
+
+  /* ── 计算投递边 ── */
+  const edges = [];
+  const hit = new Set();
+  for (const p of pubList){
+    for (const sn of nodes){
+      for (const s of sn.subscribes){
+        if (mbTopicValidateFilter(s.filter)) continue;
+        if (s.source && mbTopicValidateFilter(s.source)) continue;
+        const source = p.system ? null : nameOf(bus, p.nodeId);
+        const probe = { filter: s.filter, source: s.source, nolocal: s.nolocal, nodeName: sn.name };
+        if (!mbSubscriptionMatches(probe, p.topic, source)) continue;
+        edges.push({ from: p.nodeId, to: sn.id, topic: p.topic, filter: s.filter, system: p.system });
+        if (!p.system) hit.add(`${p.nodeId}\u0000${p.pub.id}`);
+      }
+    }
+  }
+
+  /* ── 分层：从「不接收任何东西的纯发布者」开始，按最长路径往外推 ── */
+  const outgoing = new Map(nodes.map(n => [n.id, []]));
+  for (const e of edges) if (e.from !== e.to) outgoing.get(e.from).push(e.to);
+
+  const layer = new Map(nodes.map(n => [n.id, 0]));
+  for (let iter = 0; iter <= nodes.length; iter++){
+    let changed = false;
+    for (const e of edges){
+      if (e.from === e.to) continue;
+      const want = layer.get(e.from) + 1;
+      if (want > layer.get(e.to)){ layer.set(e.to, want); changed = true; }
+    }
+    if (!changed) break;   /* 收敛；有环时会跑满迭代次数后停下（分层图不追求无环） */
+  }
+
+  /* ── 分列排版 ── */
+  const columns = new Map();
+  for (const n of nodes){
+    const L = layer.get(n.id);
+    if (!columns.has(L)) columns.set(L, []);
+    columns.get(L).push(n);
+  }
+  const maxLayer = Math.max(...columns.keys());
+  const pos = new Map();
+  let maxRows = 1;
+  for (const [L, list] of columns){
+    maxRows = Math.max(maxRows, list.length);
+    list.forEach((n, i) => pos.set(n.id, { x: PAD + L * COL_GAP, y: PAD + i * ROW_GAP }));
+  }
+  const orphans = pubList.filter(p => !p.system && !hit.has(`${p.nodeId}\u0000${p.pub.id}`));
+
+  /* 在图上拖过的节点：手工坐标覆盖自动排版 */
+  for (const n of nodes) if (n.x != null && n.y != null) pos.set(n.id, { x: n.x, y: n.y });
+
+  /* 画布尺寸：先按自动排版算一遍，再把**手工拖过的节点**也算进来。
+     只按自动排版算的话，拖到自动范围之外的节点会落到 viewBox 外面被裁掉 ——
+     表现出来就是「画布太小、节点拖不出去、松手后人不见了」。 */
+  let width  = PAD * 2 + NODE_W + maxLayer * COL_GAP + (orphans.length ? COL_GAP + 60 : 0);
+  let height = PAD * 2 + Math.max(maxRows, orphans.length || 1) * ROW_GAP;
+  for (const n of nodes){
+    if (n.x == null || n.y == null) continue;
+    width  = Math.max(width,  n.x + NODE_W + PAD);
+    height = Math.max(height, n.y + NODE_H + PAD);
+  }
+  /* ── 走线 ──────────────────────────────────────────────────────────────
+     同一条线上来回的两个方向（lvgl_ui → motor 和 motor → lvgl_ui）会算出
+     完全相同的形状：两条线重叠，两个标签也重叠在同一个交点上，而且怎么拖
+     都分不开 —— 因为它们本来就算在同一个位置。所以同一对节点之间的边要分组、
+     按序往两侧岔开「车道」，反向的那条自然落到另一侧。
+
+     分组键是**无序**节点对，这一点是关键：用有向对当键的话，
+     两条反向边各成一组的第 0 条，又重叠回去了。
+
+     偏移加在**两个控制点**上（而不是只加在垂线上），这样线可以朝任意方向
+     拖；标签跟着走 0.75 倍 —— 三次贝塞尔在 t=0.5 处正好是「中点 + 0.75×偏移」。 */
+  const LANE_STEP = 26;
+  const laneGroups = new Map();
+  edges.forEach((e, i) => {
+    if (e.from === e.to) return;
+    const lo = e.from < e.to ? e.from : e.to;
+    const hi = e.from < e.to ? e.to : e.from;
+    const k = `${lo}\u0000${hi}`;
+    if (!laneGroups.has(k)) laneGroups.set(k, []);
+    laneGroups.get(k).push(i);
+  });
+
+  graphEdges = new Map();             /* 拖动时要用的几何信息，每次重绘都重建 */
+  const draws = [];
+
+  edges.forEach((e, idx) => {
+    const A = pos.get(e.from), B = pos.get(e.to);
+    if (!A || !B) return;
+    const self = e.from === e.to;
+    const fromName = nameOf(bus, e.from), toName = nameOf(bus, e.to);
+    if (fromName == null || toName == null) return;
+
+    /* ── 端点与默认控制点 ──
+       出口按「对方在哪个方向」来选：目标在左边就从左边缘出去。
+       写死右边缘出、左边缘入的话，把节点拖到左边之后线会绕一整圈。 */
+    let p1, p2, d1, d2, horiz = true;
+    if (self){
+      p1 = { x: A.x + 26,           y: A.y };
+      p2 = { x: A.x + NODE_W - 26,  y: A.y };
+      d1 = { x: 0, y: -34 }; d2 = { x: 0, y: -34 };
+    } else {
+      const acx = A.x + NODE_W / 2, acy = A.y + NODE_H / 2;
+      const bcx = B.x + NODE_W / 2, bcy = B.y + NODE_H / 2;
+      const ddx = bcx - acx, ddy = bcy - acy;
+      if (Math.abs(ddx) >= Math.abs(ddy)){
+        const s = ddx >= 0 ? 1 : -1;
+        p1 = { x: acx + s * NODE_W / 2, y: acy };
+        p2 = { x: bcx - s * NODE_W / 2, y: bcy };
+        const pull = Math.max(30, Math.abs(p2.x - p1.x) / 2);
+        d1 = { x:  s * pull, y: 0 };
+        d2 = { x: -s * pull, y: 0 };
+      } else {
+        const s = ddy >= 0 ? 1 : -1;
+        horiz = false;
+        p1 = { x: acx, y: acy + s * NODE_H / 2 };
+        p2 = { x: bcx, y: bcy - s * NODE_H / 2 };
+        const pull = Math.max(30, Math.abs(p2.y - p1.y) / 2);
+        d1 = { x: 0, y:  s * pull };
+        d2 = { x: 0, y: -s * pull };
+      }
+    }
+
+    /* ── 车道偏移（自动）+ 手工偏移（拖出来的）──
+       两者要分开留着：拖完之后写回模型的只是**手工**那部分，
+       车道偏移是算出来的、下次排版还会重算。 */
+    let laneX = 0, laneY = 0;
+    if (!self){
+      const lo = e.from < e.to ? e.from : e.to;
+      const hi = e.from < e.to ? e.to : e.from;
+      const lane = (laneGroups.get(`${lo}\u0000${hi}`) || []).indexOf(idx);
+      /* 0 → +1、1 → -1、2 → +2、3 → -2…… 同组的两条反向边天然一正一负。 */
+      const mag = LANE_STEP * (Math.floor(lane / 2) + 1) * (lane % 2 === 0 ? 1 : -1);
+      if (horiz) laneY = mag; else laneX = mag;
+    }
+    const style = findEdgeStyle(bus, fromName, toName, e.topic);
+    const ox = laneX + (style ? (style.dx || 0) : 0);
+    const oy = laneY + (style ? (style.dy || 0) : 0);
+
+    const c1x = p1.x + d1.x + ox, c1y = p1.y + d1.y + oy;
+    const c2x = p2.x + d2.x + ox, c2y = p2.y + d2.y + oy;
+    const d = `M ${p1.x} ${p1.y} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${p2.x} ${p2.y}`;
+    /* 贝塞尔在 t=0.5 的取值：中点 + 0.375×(d1+d2) + 0.75×偏移 */
+    const lx = (p1.x + p2.x) / 2 + 0.375 * (d1.x + d2.x) + 0.75 * ox;
+    const ly = (p1.y + p2.y) / 2 + 0.375 * (d1.y + d2.y) + 0.75 * oy;
+
+    const cls   = self ? "self" : "pub";
+    const color = style && style.color ? style.color : "";
+    const fill  = color || (self ? "var(--accent)" : "var(--pub)");
+    const label = e.system ? e.topic : (e.filter === e.topic ? e.topic : `${e.topic}  ⇒  ${e.filter}`);
+    const key   = `${busId}#${idx}`;
+    const sel   = selectedEdge && selectedEdge.busId === busId
+                  && selectedEdge.key === edgeKeyOf(fromName, toName, e.topic);
+
+    graphEdges.set(key, { busId, from: fromName, to: toName, topic: e.topic,
+                          p1, p2, d1, d2, ox, oy, laneX, laneY, self, label });
+    /* 箭头 marker 是**每条边一个**，不是按颜色共用。共用的话改一条边的颜色
+       就得把同色的其它边的箭头一起改；各自一个才能只动自己那一个。 */
+    draws.push({ key, cls, d, lx, ly, label, color, fill, sel,
+                 marker: self ? "" : `arw-${busId}-${idx}`,
+                 title: `${fromName} → ${toName}\n${label}${color ? "\n颜色 " + color : ""}` });
+  });
+
+  const svg = [];
+  svg.push(`<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`);
+  svg.push(`<defs>${draws.filter(g => g.marker).map(g =>
+    `<marker id="${esc(g.marker)}" viewBox="0 0 10 10" refX="9" refY="5"
+             markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+       <path d="M0,1 L9,5 L0,9 z" fill="${esc(g.fill)}"/>
+     </marker>`).join("")}</defs>`);
+
+  /* ── 边：命中路径 / 底线 / 流向虚线 / 标签 ──
+     命中路径是一条透明的粗线 —— 1.4px 的线几乎点不中。
+     它排在标签之前，所以标签压在它上面、优先接管鼠标。 */
+  for (const g of draws){
+    const stroked = g.color ? ` style="stroke:${esc(g.color)}"` : "";
+    svg.push(`<path class="gedge-hit" data-edge-key="${esc(g.key)}" d="${g.d}"/>`);
+    svg.push(`<path class="gedge ${g.cls}${g.sel ? " sel" : ""}" data-edge-key="${esc(g.key)}"`
+           + `${g.marker ? ` data-marker="${esc(g.marker)}"` : ""} d="${g.d}"${stroked}`
+           + `${g.marker ? ` marker-end="url(#${esc(g.marker)})"` : ""}><title>${esc(g.title)}</title></path>`);
+    svg.push(`<path class="gflow ${g.cls}" data-edge-key="${esc(g.key)}" d="${g.d}"${stroked}/>`);
+  }
+  for (const g of draws){
+    const tw = g.label.length * 5.8 + 8;
+    svg.push(`<g class="glabel-g${g.sel ? " sel" : ""}" data-edge-key="${esc(g.key)}"
+      transform="translate(${g.lx},${g.ly})">
+      <title>拖动可改变这条线的形状；单击可改颜色</title>
+      <rect class="glabel-bg" x="${-tw / 2}" y="-10" width="${tw}" height="14" rx="3"/>
+      <text class="glabel" x="0" y="0" text-anchor="middle">${esc(g.label)}</text>
+    </g>`);
+  }
+
+  /* 无人订阅的主题：画成虚线小药丸 */
+  orphans.forEach((o, i) => {
+    const a = pos.get(o.nodeId);
+    if (!a) return;
+    const x = PAD + (maxLayer + 1) * COL_GAP, y = PAD + i * ROW_GAP + 12;
+    const w = Math.min(190, o.topic.length * 6.2 + 20);
+    const y1 = a.y + NODE_H / 2, y2 = y + 10;
+    const dx = Math.max(30, (x - (a.x + NODE_W)) / 2);
+    svg.push(`<path class="gedge orphan" d="M ${a.x + NODE_W} ${y1} C ${a.x + NODE_W + dx} ${y1}, ${x - dx} ${y2}, ${x} ${y2}"/>`);
+    svg.push(`<rect class="gpill" x="${x}" y="${y}" width="${w}" height="20" rx="10"/>`);
+    svg.push(`<text class="gpill-text" x="${x + 10}" y="${y + 14}">${esc(o.topic)}</text>`);
+  });
+
+  /* 节点方框 */
+  for (const n of nodes){
+    const p = pos.get(n.id);
+    const hasPub = n.publishes.length > 0;
+    const hasSub = n.subscribes.length > 0;
+    const cls = hasPub && hasSub ? "both" : hasPub ? "pub" : hasSub ? "sub" : "";
+    svg.push(`<g class="gnode ${cls}" data-gnode-id="${esc(n.id)}" data-gbus="${esc(busId)}" transform="translate(${p.x},${p.y})">
+      <title>${esc(n.name)}${n.comment ? "\n" + esc(n.comment) : ""}\n发布 ${n.publishes.length} · 订阅 ${n.subscribes.length}\n（可拖动调整位置，单击跳到表格视图）</title>
+      <rect width="${NODE_W}" height="${NODE_H}" rx="7"/>
+      <text class="nm" x="12" y="21">${esc(n.name.length > 18 ? n.name.slice(0, 17) + "…" : n.name)}</text>
+      <text class="ct" x="12" y="36">pub ${n.publishes.length} · sub ${n.subscribes.length}</text>
+    </g>`);
+  }
+  svg.push("</svg>");
+
+  const nEdge = edges.filter(e => e.from !== e.to).length;
+  return `<div class="graph-bus">
+    <header>
+      <span class="gname">${esc(bus.name || "(未命名总线)")}</span>
+      <span class="gmeta">节点 ${nodes.length} · 发布 ${pubList.filter(p => !p.system).length} · 订阅 ${nodes.reduce((a, n) => a + n.subscribes.length, 0)} · 投递路径 ${nEdge}${orphans.length ? ` · 无人订阅 ${orphans.length}` : ""}${bus.nodeEvents ? " · 含 $mb 事件" : ""}</span>
+      <span style="flex:1"></span>
+      <button class="tiny" data-act="reset-layout" data-bus="${esc(busId)}">重新自动排版</button>
+    </header>
+    <div class="graph-scroll">${svg.join("")}</div>
+  </div>`;
+}
+
+function nameOf(bus, nodeId){ const n = bus.nodes.find(x => x.id === nodeId); return n ? n.name : null; }
+
+/* ── 拖动节点：位置写回 XML 的 x / y ──────────────────────────────────
+   拖完整体重绘一次，因为连线是按坐标算好的，光改 transform 会让边留在原地。 */
+let dragState = null;
+/* 空白处左键拖拽 = 平移画布。实现的其实就是滚动那个容器。 */
+let panState = null;
+/* 拖线条 / 拖标签 = 给这条边攒一个手工偏移。 */
+let edgeState = null;
+
+/* key(`${busId}#${idx}`) -> 该边的几何信息；每次重绘重建。
+   拖动期间不动模型，松手才写回去 —— 所以这块信息得活到 mouseup。 */
+let graphEdges = new Map();
+/* 选中的边。存「名字 + 主题」算出的键（就是 XML 里认的那个），
+   重绘之后 idx 会变，但这个名字组合不会。 */
+let selectedEdge = null;          /* { busId, key } */
+
+/* 缩放是纯视野状态，不进 XML、也不进 localStorage：
+   它描述的是「你现在想看多大」，不是这份设计的一部分。 */
+let graphZoom = 1;
+const ZOOM_MIN = 0.35, ZOOM_MAX = 3;
+
+/* 颜色一律归一成 #rrggbb。XML 是手写友好的，从文件里读进来的 color 属性
+   可能是任何东西；直接塞进 SVG 属性/样式迟早出事。 */
+function normColor(s){
+  const t = String(s == null ? "" : s).trim();
+  if (/^#[0-9a-fA-F]{6}$/.test(t)) return t.toLowerCase();
+  if (/^#[0-9a-fA-F]{3}$/.test(t)) return ("#" + t[1] + t[1] + t[2] + t[2] + t[3] + t[3]).toLowerCase();
+  return "";
+}
+
+/* 把逻辑尺寸（width / height 属性）乘上缩放，落到 CSS 尺寸上。
+   viewBox 保持逻辑尺寸不变，所以缩放是浏览器替我们做的 ——
+   不用自己乘坐标，也就不会漏掉哪一处。 */
+function applyGraphZoom(){
+  for (const svg of document.querySelectorAll(".graph-scroll > svg")){
+    const w = parseFloat(svg.getAttribute("width"))  || 0;
+    const h = parseFloat(svg.getAttribute("height")) || 0;
+    if (!w || !h) continue;
+    svg.style.width  = (w * graphZoom) + "px";
+    svg.style.height = (h * graphZoom) + "px";
+  }
+  const lvl = document.getElementById("zoom-level");
+  if (lvl) lvl.textContent = Math.round(graphZoom * 100) + "%";
+}
+
+function setGraphZoom(z){ graphZoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z)); applyGraphZoom(); }
+
+/* 屏幕坐标 → SVG 用户坐标。
+   getBoundingClientRect() 给的是缩放**之后**的 CSS 盒子，viewBox 是缩放前的
+   逻辑尺寸，两者之比才是真正的换算系数。少了这一步，缩放到 50% 之后
+   拖节点会严重偏移（鼠标动 100px，节点动 200px）。 */
+function svgPoint(svg, ev){
+  const r  = svg.getBoundingClientRect();
+  const vb = svg.viewBox.baseVal;
+  const w  = (vb && vb.width)  || parseFloat(svg.getAttribute("width"))  || r.width;
+  const h  = (vb && vb.height) || parseFloat(svg.getAttribute("height")) || r.height;
+  return { x: (ev.clientX - r.left) * (w / (r.width  || 1)),
+           y: (ev.clientY - r.top)  * (h / (r.height || 1)) };
+}
+
+/* 拖动时直接改 DOM，不整块重绘 —— 重绘会丢掉「正在拖的那条边」这个状态，
+   而且每帧重建整个 SVG 会卡。松手才写回模型。 */
+function paintEdge(key, g, ox, oy){
+  const c1x = g.p1.x + g.d1.x + ox, c1y = g.p1.y + g.d1.y + oy;
+  const c2x = g.p2.x + g.d2.x + ox, c2y = g.p2.y + g.d2.y + oy;
+  const d  = `M ${g.p1.x} ${g.p1.y} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${g.p2.x} ${g.p2.y}`;
+  const lx = (g.p1.x + g.p2.x) / 2 + 0.375 * (g.d1.x + g.d2.x) + 0.75 * ox;
+  const ly = (g.p1.y + g.p2.y) / 2 + 0.375 * (g.d1.y + g.d2.y) + 0.75 * oy;
+  for (const el of document.querySelectorAll(`[data-edge-key="${key}"]`)){
+    if (el.tagName === "path") el.setAttribute("d", d);
+    else el.setAttribute("transform", `translate(${lx},${ly})`);
+  }
+}
+
+/* ── 改颜色的小面板 ── */
+function closeEdgePanel(){
+  const p = document.getElementById("edge-panel");
+  if (p) p.classList.remove("show");
+}
+
+function openEdgePanel(busId, key, atX, atY){
+  const info = graphEdges.get(key);
+  const bus  = findBus(busId);
+  if (!info || !bus) return;
+  const p = document.getElementById("edge-panel");
+  const name = document.getElementById("ep-name");
+  const color = document.getElementById("ep-color");
+  if (!p || !name || !color) return;
+
+  const cur = findEdgeStyle(bus, info.from, info.to, info.topic);
+  name.textContent = `${info.from} → ${info.to}`;
+  /* 没设过颜色时，把当前实际生效的默认色填进色板，免得打开一看是黑的
+     —— 用户会以为「这条线本来就是黑的」，然后一改就把默认色固化下来。
+     默认色从 CSS 变量里读，而不是查元素的计算样式：视图隐藏时
+     getComputedStyle 给不出真值。 */
+  const defVar = info.self ? "--accent" : "--pub";
+  const defCol = (getComputedStyle(document.documentElement)
+                    .getPropertyValue(defVar) || "").trim();
+  color.value = (cur && cur.color) ? cur.color : (normColor(defCol) || "#4c9aff");
+  p.dataset.bus   = busId;
+  p.dataset.key   = key;
+  p.classList.add("show");
+
+  /* 先显示再量尺寸，否则 offsetWidth 是 0，算不出该怎么躲开屏幕边缘。 */
+  const w = p.offsetWidth, h = p.offsetHeight;
+  p.style.left = Math.max(6, Math.min(window.innerWidth  - w - 6, atX + 10)) + "px";
+  p.style.top  = Math.max(6, Math.min(window.innerHeight - h - 6, atY + 12)) + "px";
+}
+
+document.addEventListener("mousedown", (ev) => {
+  if (ev.button !== 0) return;
+
+  /* 面板和里面的控件自己处理点击。 */
+  if (ev.target.closest("#edge-panel")) return;
+
+  const g   = ev.target.closest(".gnode[data-gnode-id]");
+  const eEl = ev.target.closest("[data-edge-key]");
+
+  /* 命中优先级：节点 > 线/标签 > 空白。
+     线在节点下面画，所以节点必须优先 —— 不然边一穿过方框，
+     方框就再也拖不动了。 */
+  if (!g && eEl){
+    const key = eEl.dataset.edgeKey;
+    const info = graphEdges.get(key);
+    if (info){
+      edgeState = {
+        key, info, moved: false,
+        startX: ev.clientX, startY: ev.clientY,
+        svg: eEl.ownerSVGElement,          /* 拖出 SVG 之外时 target 会变，先记住 */
+        pt: svgPoint(eEl.ownerSVGElement, ev),
+        ox: info.ox, oy: info.oy
+      };
+      closeEdgePanel();
+      document.body.style.userSelect = "none";
+      ev.preventDefault();
+      return;
+    }
+  }
+
+  /* 没点在方框上：如果点在关系图的空白处，就平移整张画布。
+     命中方框优先——不然节点一旦压住空白就再也拖不动了。 */
+  if (!g){
+    const scroller = ev.target.closest(".graph-scroll");
+    if (!scroller) return;
+    /* 点空白 = 取消选中。 */
+    if (selectedEdge){ selectedEdge = null; closeEdgePanel(); renderGraph(); }
+    panState = {
+      scroller, startX: ev.clientX, startY: ev.clientY,
+      sl: scroller.scrollLeft, st: scroller.scrollTop
+    };
+    scroller.classList.add("panning");
+    document.body.style.userSelect = "none";
+    ev.preventDefault();
+    return;
+  }
+
+  const m = /translate\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)/.exec(g.getAttribute("transform") || "");
+  if (!m) return;
+  const pt = svgPoint(g.ownerSVGElement, ev);
+  dragState = {
+    g, nodeId: g.dataset.gnodeId, moved: false, last: null,
+    offX: pt.x - parseFloat(m[1]), offY: pt.y - parseFloat(m[2]),
+    startX: ev.clientX, startY: ev.clientY
+  };
+  ev.preventDefault();
+});
+
+/* Ctrl + 滚轮缩放，以光标为锚点：放大之后指针底下还是原来那个东西。
+   passive:false 是必需的 —— 不然 preventDefault() 不生效，
+   浏览器会同时把页面缩放掉。 */
+document.addEventListener("wheel", (ev) => {
+  if (!ev.ctrlKey) return;
+  const scroller = ev.target.closest && ev.target.closest(".graph-scroll");
+  const svg = scroller && scroller.querySelector("svg");
+  if (!svg) return;
+  ev.preventDefault();
+
+  const before = svg.getBoundingClientRect();
+  const vb   = svg.viewBox.baseVal;
+  const old  = graphZoom;
+  const k    = Math.exp(-ev.deltaY * 0.0015);    /* 往上滚 = 放大 */
+  const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, old * k));
+  if (next === old) return;
+
+  /* 光标处的「逻辑坐标」缩放前后必须停在原地。
+     它在内容里的位置是 cx（逻辑坐标），对应的像素位置是 px；
+     缩放后 cx 会跑到 cx*(next/old) 处，把滚动条补上这个差值即可。 */
+  const px = ev.clientX - before.left, py = ev.clientY - before.top;
+  const cx = px * (vb.width  / (before.width  || 1));
+  const cy = py * (vb.height / (before.height || 1));
+
+  setGraphZoom(next);                            /* next 可能被夹住，所以用实际值算 */
+
+  const grow = next / old;
+  scroller.scrollLeft += cx * grow - px;
+  scroller.scrollTop  += cy * grow - py;
+}, { passive: false });
+
+document.addEventListener("mousemove", (ev) => {
+  if (edgeState){
+    if (!edgeState.moved &&
+        Math.abs(ev.clientX - edgeState.startX) + Math.abs(ev.clientY - edgeState.startY) > 3)
+      edgeState.moved = true;
+    if (!edgeState.moved) return;
+    const pt = svgPoint(edgeState.svg, ev);
+    /* 标签走 0.75 倍（贝塞尔 t=0.5 的系数），所以反推偏移要除以它。 */
+    const ox = edgeState.ox + (pt.x - edgeState.pt.x) / 0.75;
+    const oy = edgeState.oy + (pt.y - edgeState.pt.y) / 0.75;
+    paintEdge(edgeState.key, edgeState.info, ox, oy);
+    edgeState.last = { ox, oy };
+    return;
+  }
+
+  if (panState){
+    /* 往哪边拖，内容就往哪边走：所以是「减去」位移。 */
+    panState.scroller.scrollLeft = panState.sl - (ev.clientX - panState.startX);
+    panState.scroller.scrollTop  = panState.st - (ev.clientY - panState.startY);
+    return;
+  }
+
+  if (!dragState) return;
+  if (!dragState.moved &&
+      Math.abs(ev.clientX - dragState.startX) + Math.abs(ev.clientY - dragState.startY) > 3)
+    dragState.moved = true;
+  if (!dragState.moved) return;
+
+  const pt = svgPoint(dragState.g.ownerSVGElement, ev);
+  const x = Math.max(0, pt.x - dragState.offX);
+  const y = Math.max(0, pt.y - dragState.offY);
+  dragState.g.setAttribute("transform", `translate(${x},${y})`);
+  dragState.last = { x, y };
+
+  /* 拖着拖着把画布撑大。只改 transform 不改 viewBox 的话，指针一越过边界
+     节点就被裁掉，用户根本没法把图摊开 —— 这正是「拖不出去」的来源。
+     撑大只动 viewBox 和尺寸属性，不动里面任何元素，所以坐标不需要重算。
+
+     尺寸属性改完之后要重算一次 CSS 尺寸：缩放就是靠 style.width/height
+     撑出来的，属性变了样式不跟着变，SVG 会被压回旧的那一格。 */
+  const svg = dragState.g.ownerSVGElement;
+  const curW = parseFloat(svg.getAttribute("width"))  || 0;
+  const curH = parseFloat(svg.getAttribute("height")) || 0;
+  const needW = x + NODE_W + PAD;
+  const needH = y + NODE_H + PAD;
+  if (needW > curW || needH > curH){
+    const w = Math.max(curW, needW), h = Math.max(curH, needH);
+    svg.setAttribute("width", w);
+    svg.setAttribute("height", h);
+    svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+    applyGraphZoom();
+  }
+
+  document.body.style.userSelect = "none";
+});
+
+document.addEventListener("mouseup", () => {
+  if (edgeState){
+    document.body.style.userSelect = "";
+    const st = edgeState;
+    edgeState = null;
+    const info = st.info;
+    if (st.moved && st.last){
+      /* 手工偏移是**叠加**在自动车道上的，所以写回去的是总量减车道量。
+         不减去的话，同组里另外那条边一动，这条会跟着跳一下。 */
+      const bus = findBus(info.busId);
+      if (bus){
+        setEdgeStyle(bus, info.from, info.to, info.topic, {
+          dx: Math.round(st.last.ox - info.laneX),
+          dy: Math.round(st.last.oy - info.laneY)
+        });
+        schedulePersist();
+      }
+    } else {
+      /* 没移动 = 单击：选中它并弹出改颜色的小面板。 */
+      const info2 = graphEdges.get(st.key);
+      if (info2){
+        selectedEdge = { busId: info2.busId, key: edgeKeyOf(info2.from, info2.to, info2.topic) };
+        renderGraph();
+        openEdgePanel(info2.busId, st.key, st.startX, st.startY);
+      }
+    }
+    return;
+  }
+
+  if (panState){
+    panState.scroller.classList.remove("panning");
+    document.body.style.userSelect = "";
+    panState = null;
+    return;
+  }
+
+  if (!dragState) return;
+  document.body.style.userSelect = "";
+  const st = dragState;
+  dragState = null;
+
+  if (st.moved && st.last){
+    const r = findNode(st.nodeId);
+    if (r){ r.node.x = Math.round(st.last.x); r.node.y = Math.round(st.last.y); }
+    renderGraph();          /* 重算连线端点 */
+    schedulePersist();
+  } else {
+    gotoNode(st.nodeId);    /* 没移动 = 单击，跳到表格视图的对应节点 */
+  }
+});
+
+/* ==========================================================================
+ * 7. 渲染：侧栏树 / 校验面板 / 状态栏
+ * ========================================================================== */
+
+function renderTree(){
+  const host = document.getElementById("tree");
+  let n = 0;
+  for (const b of doc.buses) n += b.nodes.length;
+  document.getElementById("tree-count").textContent = String(n);
+
+  if (doc.buses.length === 0){ host.innerHTML = `<div class="hint">（空）</div>`; return; }
+
+  host.innerHTML = doc.buses.map(bus => {
+    const bcls = !bus.name.trim() ? "bad" : "";
+    const nodes = bus.nodes.map(node => {
+      const hasPub = node.publishes.length > 0, hasSub = node.subscribes.length > 0;
+      const cls = hasPub && hasSub ? "both" : hasPub ? "pub" : hasSub ? "sub" : "none";
+      const act = node.id === selectedNodeId ? " active" : "";
+      return `<div class="tree-node${act}" data-goto-node="${esc(node.id)}">
+        <span class="dot ${cls}"></span>
+        <span class="nname">${esc(node.name || "(未命名)")}</span>
+        <span class="cnt">${node.publishes.length}/${node.subscribes.length}</span>
+      </div>`;
+    }).join("") || `<div class="hint" style="padding-left:18px">（无节点）</div>`;
+    return `<div class="tree-bus">
+      <div class="row"><span class="dot" style="background:var(--accent)"></span>
+        <span class="bname ${bcls}" data-goto-bus="${esc(bus.id)}">${esc(bus.name || "(未命名总线)")}</span>
+        <button class="tiny" data-act="add-node" data-bus="${esc(bus.id)}">+</button>
+      </div>${nodes}</div>`;
+  }).join("");
+}
+
+function renderValidation(){
+  const { issues } = analyze();
+  const groups = { error: [], warn: [], info: [] };
+  for (const i of issues) groups[i.level].push(i);
+
+  const head = { error: "✕ 错误", warn: "! 警告", info: "i 提示" };
+  const desc = {
+    error: "固件里会直接失败或行为不符预期",
+    warn:  "能跑起来，但多半不是你想要的",
+    info:  "供参考，不一定有问题"
+  };
+
+  document.getElementById("v-total").textContent = String(issues.length);
+
+  let html = "";
+  if (issues.length === 0){
+    html = `<div class="vnone">没有发现问题。<br><span style="color:var(--fg-mute)">发布与订阅的关系自洽。</span></div>`;
+  } else {
+    for (const lv of ["error", "warn", "info"]){
+      if (groups[lv].length === 0) continue;
+      html += `<div class="vgroup ${lv}">
+        <div class="head"><span>${head[lv]}</span><span class="count">${groups[lv].length}</span>
+          <span style="color:var(--fg-mute); font-size:10px; font-weight:400">${desc[lv]}</span></div>`;
+      for (const it of groups[lv]){
+        html += `<div class="vitem" ${it.nodeId ? `data-goto-node="${esc(it.nodeId)}"` : (it.busId ? `data-goto-bus="${esc(it.busId)}"` : "")}>
+          <span class="ico">${lv === "error" ? "✕" : lv === "warn" ? "!" : "i"}</span>
+          <span class="body"><span>${it.msg}</span><span class="where">${esc(it.where)}</span></span>
+        </div>`;
+      }
+      html += `</div>`;
+    }
+  }
+  document.getElementById("validation").innerHTML = html;
+}
+
+function renderStatus(){
+  const { issues, } = analyze();
+  const nodes = doc.buses.reduce((a, b) => a + b.nodes.length, 0);
+  const pubs  = doc.buses.reduce((a, b) => a + b.nodes.reduce((x, n) => x + n.publishes.length, 0), 0);
+  const subs  = doc.buses.reduce((a, b) => a + b.nodes.reduce((x, n) => x + n.subscribes.length, 0), 0);
+  const nErr  = issues.filter(i => i.level === "error").length;
+  const nWarn = issues.filter(i => i.level === "warn").length;
+
+  document.getElementById("stat-counts").innerHTML =
+    `总线 <b>${doc.buses.length}</b> · 节点 <b>${nodes}</b> · 发布 <b>${pubs}</b> · 订阅 <b>${subs}</b>`;
+  document.getElementById("stat-state").innerHTML =
+    nErr ? `<span style="color:var(--err)">${nErr} 个错误</span>` :
+    nWarn ? `<span style="color:var(--warn)">${nWarn} 个警告</span>` :
+    `<span style="color:var(--ok)">校验通过</span>`;
+}
+
+function renderAll(){
+  renderTable();
+  renderGraph();
+  renderTree();
+  renderValidation();
+  renderStatus();
+  document.getElementById("doc-title").value = doc.title;
+  document.getElementById("doc-comment").value = doc.comment;
+}
+
+/* ==========================================================================
+ * 8. 编辑操作
+ * ========================================================================== */
+
+function gotoNode(nodeId){
+  selectedNodeId = nodeId;
+  if (currentView !== "table") setView("table");
+  renderTree();
+  for (const el of document.querySelectorAll(".node-card")) el.classList.remove("active");
+  const card = document.getElementById(`node-${CSS.escape(nodeId)}`);
+  if (card){
+    card.classList.add("active");
+    card.scrollIntoView({ block: "center", behavior: "smooth" });
+    card.classList.remove("flash"); void card.offsetWidth; card.classList.add("flash");
+  }
+}
+function gotoBus(busId){
+  if (currentView !== "table") setView("table");
+  const el = document.getElementById(`bus-${CSS.escape(busId)}`);
+  if (el) el.scrollIntoView({ block: "start", behavior: "smooth" });
+}
+
+/* 事件委托：所有 data-act 按钮 */
+document.addEventListener("click", (ev) => {
+  const goto = ev.target.closest("[data-goto-node]");
+  if (goto && !ev.target.closest("button")){ gotoNode(goto.dataset.gotoNode); return; }
+  const gotoB = ev.target.closest("[data-goto-bus]");
+  if (gotoB && !ev.target.closest("button")){ gotoBus(gotoB.dataset.gotoBus); return; }
+
+  const el = ev.target.closest("[data-act]");
+  if (!el) return;
+  const act = el.dataset.act;
+  const bid = el.dataset.bus, nid = el.dataset.node, idx = el.dataset.idx;
+
+  if (act === "add-bus" || act === "load-sample"){
+    if (act === "load-sample"){ loadSample(); return; }
+    const b = newBus(`bus_${doc.buses.length + 1}`);
+    doc.buses.push(b); commit(); return;
+  }
+  if (act === "del-bus"){
+    const b = findBus(bid);
+    if (b && confirm(`删除总线「${b.name || "(未命名)"}」及其 ${b.nodes.length} 个节点？`)){
+      doc.buses = doc.buses.filter(x => x.id !== bid); commit();
+    }
+    return;
+  }
+  if (act === "add-node"){
+    const b = findBus(bid);
+    if (b){
+      const n = newNode(`node_${b.nodes.length + 1}`);
+      b.nodes.push(n); selectedNodeId = n.id; commit();
+      const el2 = document.querySelector(`[data-field="node-name"][data-node="${CSS.escape(n.id)}"]`);
+      if (el2){ el2.focus(); el2.select(); }
+    }
+    return;
+  }
+  if (act === "del-node"){
+    const r = findNode(nid);
+    if (r && confirm(`删除节点「${r.node.name || "(未命名)"}」及其全部发布/订阅？`)){
+      r.bus.nodes = r.bus.nodes.filter(x => x.id !== nid);
+      if (selectedNodeId === nid) selectedNodeId = null;
+      commit();
+    }
+    return;
+  }
+  if (act === "add-pub"){
+    const r = findNode(nid);
+    if (r){
+      r.node.publishes.push(newPublish()); commit();
+      const el2 = document.querySelector(`[data-field="pub-topic"][data-node="${CSS.escape(nid)}"][data-idx="${r.node.publishes.length - 1}"]`);
+      if (el2) el2.focus();
+    }
+    return;
+  }
+  if (act === "del-pub"){
+    const r = findNode(nid);
+    if (r){ r.node.publishes.splice(+idx, 1); commit(); }
+    return;
+  }
+  if (act === "add-sub"){
+    const r = findNode(nid);
+    if (r){
+      r.node.subscribes.push(newSubscribe()); commit();
+      const el2 = document.querySelector(`[data-field="sub-filter"][data-node="${CSS.escape(nid)}"][data-idx="${r.node.subscribes.length - 1}"]`);
+      if (el2) el2.focus();
+    }
+    return;
+  }
+  if (act === "del-sub"){
+    const r = findNode(nid);
+    if (r){ r.node.subscribes.splice(+idx, 1); commit(); }
+    return;
+  }
+  if (act === "reset-layout"){
+    const b = findBus(bid);
+    if (b){
+      for (const n of b.nodes){ n.x = null; n.y = null; }
+      /* 线的形状也一起还原 —— 位置都重排了，留着旧偏移只会让线缠成一团。
+         颜色是人特地挑的，不属于「位置」，保留。 */
+      for (const e of (b.edges || [])){ e.dx = null; e.dy = null; }
+      selectedEdge = null; closeEdgePanel();
+      commit();
+    }
+    return;
+  }
+  if (act === "toggle-code"){
+    /* 收起时顺手丢掉缓存：下次展开算作「首次生成」，不会因为期间改过配置
+       而把整段代码闪一遍。 */
+    if (codeOpen.has(nid)){ codeOpen.delete(nid); codeCache.delete(nid); }
+    else codeOpen.add(nid);
+    commit();
+    return;
+  }
+  if (act === "toggle-bus-code"){
+    if (busCodeOpen.has(bid)){ busCodeOpen.delete(bid); codeCache.delete(bid); }
+    else busCodeOpen.add(bid);
+    commit();
+    return;
+  }
+  /* 缩放只动视野，不碰文档 —— 所以不走 commit()，不然会把表格视图也重绘一遍。 */
+  if (act === "zoom-in")    { setGraphZoom(graphZoom * 1.2); return; }
+  if (act === "zoom-out")   { setGraphZoom(graphZoom / 1.2); return; }
+  if (act === "zoom-reset") { setGraphZoom(1);               return; }
+});
+
+/* ── 改颜色的小面板 ──────────────────────────────────────────────────────
+   面板本身不在 <svg> 里，所以它的点击不会经过上面那套委托，单独接。 */
+document.getElementById("ep-color").addEventListener("input", (ev) => {
+  const p = document.getElementById("edge-panel");
+  const info = graphEdges.get(p.dataset.key);
+  const bus  = findBus(p.dataset.bus);
+  if (!info || !bus) return;
+  const color = normColor(ev.target.value);
+  setEdgeStyle(bus, info.from, info.to, info.topic, { color });
+  /* 只改颜色，不整块重绘：色板正在被拖动，重建 DOM 会把输入框抽掉、打断操作。
+     直接改现有元素的描边和它自己的那个箭头，视觉上立刻生效。 */
+  for (const el of document.querySelectorAll(`[data-edge-key="${p.dataset.key}"]`)){
+    if (el.tagName === "path" && !el.classList.contains("gedge-hit")) el.style.stroke = color;
+  }
+  const base = document.querySelector(`path.gedge[data-edge-key="${p.dataset.key}"]`);
+  const mk = base && base.dataset.marker &&
+             base.ownerSVGElement.querySelector(`#${CSS.escape(base.dataset.marker)} path`);
+  if (mk) mk.setAttribute("fill", color || "var(--pub)");
+  schedulePersist();
+});
+
+document.getElementById("ep-reset").addEventListener("click", () => {
+  const p = document.getElementById("edge-panel");
+  const info = graphEdges.get(p.dataset.key);
+  const bus  = findBus(p.dataset.bus);
+  if (info && bus){
+    setEdgeStyle(bus, info.from, info.to, info.topic, { color: "" });
+    schedulePersist();
+    renderGraph();
+    openEdgePanel(p.dataset.bus, p.dataset.key, p.getBoundingClientRect().left,
+                  p.getBoundingClientRect().bottom);
+  }
+});
+
+document.getElementById("ep-close").addEventListener("click", () => {
+  selectedEdge = null; closeEdgePanel(); renderGraph();
+});
+
+/* 点面板以外的地方就收起来（点空白处会另走 renderGraph，这里只兜底）。 */
+document.addEventListener("mousedown", (ev) => {
+  const p = document.getElementById("edge-panel");
+  if (p && p.classList.contains("show") && !ev.target.closest("#edge-panel")
+      && !ev.target.closest("[data-edge-key]"))
+    closeEdgePanel();
+}, true);
+
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && selectedEdge){ selectedEdge = null; closeEdgePanel(); renderGraph(); }
+});
+
+/* 事件委托：所有输入 */
+function onFieldInput(ev){
+  const el = ev.target;
+  const f = el.dataset.field;
+  if (!f) return;
+  const bid = el.dataset.bus, nid = el.dataset.node, idx = el.dataset.idx;
+
+  if (f === "doc-title"){ doc.title = el.value; schedulePersist(); return; }
+  if (f === "doc-comment"){ doc.comment = el.value; schedulePersist(); return; }
+
+  const bus = bid ? findBus(bid) : null;
+  if (f === "bus-name" && bus){ bus.name = el.value; }
+  else if (f === "bus-comment" && bus){ bus.comment = el.value; }
+  else if (f === "bus-nodeevents" && bus){ bus.nodeEvents = el.checked; }
+
+  const r = nid ? findNode(nid) : null;
+  if (r){
+    const node = r.node;
+    if (f === "node-name"){ node.name = el.value; }
+    else if (f === "node-comment"){ node.comment = el.value; }
+    else if (f === "pub-topic" && node.publishes[+idx]){ node.publishes[+idx].topic = el.value; }
+    else if (f === "pub-payload" && node.publishes[+idx]){ node.publishes[+idx].payload = el.value; }
+    else if (f === "pub-retain" && node.publishes[+idx]){ node.publishes[+idx].retain = el.checked; }
+    else if (f === "pub-to" && node.publishes[+idx]){ node.publishes[+idx].to = el.value.trim(); }
+    else if (f === "pub-comment" && node.publishes[+idx]){ node.publishes[+idx].comment = el.value; }
+    else if (f === "sub-filter" && node.subscribes[+idx]){ node.subscribes[+idx].filter = el.value; }
+    else if (f === "sub-source" && node.subscribes[+idx]){ node.subscribes[+idx].source = el.value.trim(); }
+    else if (f === "sub-nolocal" && node.subscribes[+idx]){ node.subscribes[+idx].nolocal = el.checked; }
+    else if (f === "sub-skipretained" && node.subscribes[+idx]){ node.subscribes[+idx].skipRetained = el.checked; }
+    else if (f === "sub-comment" && node.subscribes[+idx]){ node.subscribes[+idx].comment = el.value; }
+  }
+
+  /* 代码块也是「派生显示」：输入时不重建卡片，所以要单独把它刷一遍。
+     新增/改动的行闪一下背景，其余不变。 */
+  if (r && codeOpen.has(r.node.id))
+    renderCodeBlock(r.node.id, nodeCodeLines(r.bus, r.node), true);
+  if (bus && busCodeOpen.has(bus.id))
+    renderCodeBlock(bus.id, busCodeLines(bus), true);
+
+  refreshDerived();
+  scheduleGraphRefresh();
+  schedulePersist();
+}
+document.addEventListener("input", onFieldInput);
+document.addEventListener("change", onFieldInput);
+
+/* ==========================================================================
+ * 9. 视图切换 / 侧栏收起
+ * ========================================================================== */
+
+function setView(v){
+  currentView = v;
+  document.getElementById("view-table").classList.toggle("hidden", v !== "table");
+  document.getElementById("view-graph").classList.toggle("hidden", v !== "graph");
+  document.getElementById("tab-table").classList.toggle("active", v === "table");
+  document.getElementById("tab-graph").classList.toggle("active", v === "graph");
+  if (v === "graph") renderGraph();
+}
+
+/* ==========================================================================
+ * 10. 持久化：localStorage 自动保存 + 文件导入导出
+ * ========================================================================== */
+
+let persistTimer = null, graphTimer = null;
+
+function schedulePersist(){
+  clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, docToXml());
+      document.getElementById("stat-state").dataset.saved = "1";
+    } catch (e){
+      toast("自动保存到 localStorage 失败：" + e.message, true);
+    }
+  }, 500);
+}
+function scheduleGraphRefresh(){
+  if (currentView !== "graph") return;
+  clearTimeout(graphTimer);
+  graphTimer = setTimeout(renderGraph, 250);
+}
+
+function commit(){
+  renderAll();
+  schedulePersist();
+}
+
+function toast(msg, isErr){
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.toggle("err", !!isErr);
+  t.classList.add("show");
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.classList.remove("show"), 2400);
+}
+
+function setFileLabel(name){
+  document.getElementById("stat-file").textContent = name ? `文件：${name}` : "尚未保存到文件";
+}
+
+async function saveToFile(forcePicker){
+  const xml = docToXml();
+
+  /* 优先用 File System Access API：能真正「保存到本地磁盘」，而不是下载一份副本。
+     file:// 下部分浏览器不提供该 API，退回下载。 */
+  const canPicker = typeof window.showSaveFilePicker === "function";
+
+  if (!forcePicker && fileHandle){
+    try {
+      const w = await fileHandle.createWritable();
+      await w.write(xml); await w.close();
+      setFileLabel(fileHandle.name); toast(`已保存到 ${fileHandle.name}`);
+      return;
+    } catch (e){ toast("写入文件失败：" + e.message, true); return; }
+  }
+
+  if (canPicker){
+    try {
+      fileHandle = await window.showSaveFilePicker({
+        suggestedName: suggestFileName(),
+        types: [{ description: "消息总线设计 (XML)", accept: { "application/xml": [".xml"] } }]
+      });
+      const w = await fileHandle.createWritable();
+      await w.write(xml); await w.close();
+      setFileLabel(fileHandle.name); toast(`已保存到 ${fileHandle.name}`);
+      return;
+    } catch (e){
+      if (e.name === "AbortError") return;
+      /* 其它错误（例如 file:// 下被拒绝）就退回下载 */
+    }
+  }
+
+  downloadXml(xml);
+}
+
+function suggestFileName(){
+  const base = (doc.title || doc.buses[0] && doc.buses[0].name || "message-bus-design")
+    .replace(/[\\/:*?"<>|]/g, "_").trim() || "message-bus-design";
+  return base.endsWith(".xml") ? base : base + ".xml";
+}
+
+function downloadXml(xml){
+  const blob = new Blob([xml], { type: "application/xml;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = suggestFileName();
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+  toast("已导出 " + a.download);
+}
+
+function importText(text, sourceName){
+  let parsed;
+  try { parsed = xmlToDoc(text); }
+  catch (e){ toast("导入失败：" + e.message, true); return; }
+  doc = parsed;
+  selectedNodeId = null;
+  fileHandle = null;
+  setFileLabel(sourceName || null);
+  renderAll();
+  schedulePersist();
+  toast(`已导入 ${doc.buses.length} 条总线 / ${doc.buses.reduce((a, b) => a + b.nodes.length, 0)} 个节点`);
+}
+
+/* ==========================================================================
+ * 11. 示例文档（对应 examples/03_lvgl_motor_sensor.c）
+ * ========================================================================== */
+
+function sampleDoc(){
+  const d = emptyDoc();
+  d.title = "LVGL / 电机 / 传感器解耦（对应 examples/03）";
+  d.comment = "三个节点互为陌生人：界面只认主题名，传感器只管上报，电机只认 motor/cmd。\n"
+            + "换平台时把 motor 的回调换成 HAL、把 sensor 的定时发布换成 ADC 即可，其余不动。";
+
+  const bus = newBus("app");
+  bus.nodeEvents = true;
+  bus.comment = "主应用总线。PC 模拟器与 MCU 固件跑的是同一份代码，只有 OS 抽象层不同。";
+
+  const sensor = newNode("sensor");
+  sensor.comment = "ADC 采样任务。只往 sensor/... 发数据，不关心有没有界面在听。\n注意：回调在发布者线程里同步执行，所以 UI 相关处理要留给 LVGL 线程。";
+  sensor.publishes.push(Object.assign(newPublish(), {
+    topic: "sensor/temp/value", payload: "23.4", retain: true,
+    comment: "用 retained：界面比传感器后启动时，subscription 返回前就能立刻拿到当前值，不用等下一次采样。"
+  }));
+  sensor.publishes.push(Object.assign(newPublish(), {
+    topic: "sensor/humi/value", payload: "55.0", retain: true, comment: "同上。"
+  }));
+
+  const motor = newNode("motor");
+  motor.comment = "电机控制节点。真实工程里这里换成 PWM / GPIO / 编码器驱动。";
+  motor.publishes.push(Object.assign(newPublish(), {
+    topic: "motor/speed/status", payload: "0 rpm", retain: true,
+    comment: "状态类消息用 retained，否则后启动的界面会一直显示 (no data)。"
+  }));
+  motor.subscribes.push(Object.assign(newSubscribe(), {
+    filter: "motor/cmd",
+    comment: "命令类消息**不要**用 retained：否则后加入的订阅者会重放一条早就过期的命令。\n这就是 examples/03 里 ui_button_set_speed() 传 flags = 0 的原因。"
+  }));
+
+  const ui = newNode("lvgl_ui");
+  ui.comment = "LVGL 界面节点。只订阅，不发布任何硬件相关的东西。\n重要：不要在回调里直接调用 lv_label_set_text()——回调跑在发布者线程，而 LVGL 不是线程安全的。\n推荐做法：回调只写变量/环形缓冲，由 LVGL 线程定时刷新；或 lv_async_call() 抛回 UI 线程。";
+  ui.publishes.push(Object.assign(newPublish(), {
+    topic: "motor/cmd", payload: "speed=1200",
+    comment: "按钮事件：发命令给电机节点，而不是直接调用电机驱动。等价写法 mb_node_publish_to(ui, \"motor\", \"cmd\", ...)。"
+  }));
+  ui.subscribes.push(Object.assign(newSubscribe(), {
+    filter: "sensor/+/value",
+    comment: "'+' 恰好匹配一层：sensor/temp/value 和 sensor/humi/value 都会命中；\n但 sensor/room1/temp/value 不会（那是三层）。"
+  }));
+  ui.subscribes.push(Object.assign(newSubscribe(), {
+    filter: "motor/+/status", comment: "同上，电机状态。"
+  }));
+
+  bus.nodes.push(sensor, motor, ui);
+  d.buses.push(bus);
+  return d;
+}
+
+function loadSample(){
+  if (doc.buses.length && !confirm("载入示例会覆盖当前内容（已自动保存到本地的副本不受影响）。继续？")) return;
+  doc = sampleDoc();
+  selectedNodeId = null; fileHandle = null; setFileLabel(null);
+  renderAll(); schedulePersist();
+  toast("已载入示例（examples/03 的对应设计）");
+}
+
+/* ==========================================================================
+ * 12. 启动
+ * ========================================================================== */
+
+document.getElementById("tab-table").onclick = () => setView("table");
+document.getElementById("tab-graph").onclick = () => setView("graph");
+document.getElementById("btn-new").onclick = () => {
+  if (doc.buses.length && !confirm("新建会清空当前内容（localStorage 里的自动保存会被覆盖）。继续？")) return;
+  doc = emptyDoc(); selectedNodeId = null; fileHandle = null; setFileLabel(null);
+  renderAll(); schedulePersist(); toast("已新建空白设计");
+};
+document.getElementById("btn-sample").onclick = loadSample;
+document.getElementById("btn-add-bus").onclick = () => {
+  doc.buses.push(newBus(`bus_${doc.buses.length + 1}`)); commit();
+};
+document.getElementById("btn-save").onclick = () => saveToFile(false);
+document.getElementById("btn-saveas").onclick = () => saveToFile(true);
+document.getElementById("btn-export").onclick = () => downloadXml(docToXml());
+document.getElementById("btn-import").onclick = () => document.getElementById("file-input").click();
+document.getElementById("file-input").onchange = (ev) => {
+  const f = ev.target.files[0];
+  if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => importText(String(rd.result), f.name);
+  rd.onerror = () => toast("读取文件失败", true);
+  rd.readAsText(f, "utf-8");
+  ev.target.value = "";
+};
+document.getElementById("btn-clear-local").onclick = () => {
+  if (!confirm("清除浏览器里自动保存的副本？当前编辑内容不受影响。")) return;
+  localStorage.removeItem(STORAGE_KEY); toast("已清除本地自动保存");
+};
+document.getElementById("btn-sidebar").onclick = () => {
+  const l = document.getElementById("layout");
+  l.classList.toggle("no-sidebar");
+  document.getElementById("sidebar").classList.toggle("hidden", l.classList.contains("no-sidebar"));
+};
+document.getElementById("btn-inspector").onclick = () => {
+  const l = document.getElementById("layout");
+  l.classList.toggle("no-inspector");
+  document.getElementById("inspector").classList.toggle("hidden", l.classList.contains("no-inspector"));
+};
+document.addEventListener("keydown", (ev) => {
+  if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s"){ ev.preventDefault(); saveToFile(false); }
+});
+
+(function boot(){
+  /* 版本号：与 mb_version.h 保持一致，方便一眼看出网页对应哪版库 */
+  document.getElementById("libver").textContent = "message_bus 1.0.0";
+
+  /* 开页先自检：确认网页里的主题规则没被改坏、仍与固件一致。
+     命令行版本是 tools/web-selftest.js（cscript），两边跑的是同一张用例表。 */
+  const stFails = window.mbSelfTest();
+  if (stFails.length)
+    toast("内部自检未通过（" + stFails.length + " 项）：主题规则可能已与固件不一致，详见控制台", true);
+
+  const saved = localStorage.getItem(STORAGE_KEY);
+  if (saved){
+    try { doc = xmlToDoc(saved); document.getElementById("stat-file").textContent = "来自浏览器本地自动保存"; }
+    catch (e){
+      console.warn("localStorage 里的内容无法解析，已改用示例：", e);
+      doc = sampleDoc();
+    }
+  } else {
+    doc = sampleDoc();
+  }
+
+  renderAll();
+  setView("table");
+
+  /* 窗口尺寸一变，关系图的「至少铺满可视区」就得重算，否则最大化窗口后
+     画布还是按旧高度画的。拖拽过程中不重绘 —— 那会把正被拖的元素从脚下抽走。 */
+  let resizeTimer = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if (!dragState && currentView === "graph") renderGraph();
+    }, 150);
+  });
+
+  window.addEventListener("beforeunload", () => {
+    try { localStorage.setItem(STORAGE_KEY, docToXml()); } catch (e){ /* 忽略 */ }
+  });
+})();
+</script>
+</body>
+</html>

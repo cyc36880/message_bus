@@ -1,0 +1,257 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  workflow_dispatch:
+
+# 同一分支的新 push 取消仍在跑的旧任务
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CTEST_OUTPUT_ON_FAILURE: 1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 三平台：编译 + 单元测试 + 跑示例
+  # ---------------------------------------------------------------------------
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux (GCC)
+            os: ubuntu-latest
+            shell: bash
+            generator: -G Ninja
+          - name: Linux (Clang)
+            os: ubuntu-latest
+            shell: bash
+            generator: -G Ninja
+            cc: clang
+            cxx: clang++
+          - name: macOS (AppleClang)
+            os: macos-latest
+            shell: bash
+            generator: -G Ninja
+          - name: Windows (MinGW / MSYS2 UCRT64)
+            os: windows-latest
+            shell: msys2 {0}
+            generator: -G Ninja
+
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- Windows：准备 MSYS2 UCRT64 工具链 ----
+      - name: 安装 MSYS2 工具链
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-make
+
+      # ---- 其它平台：准备 cmake / ninja ----
+      - name: 安装构建工具
+        if: runner.os != 'Windows'
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y ninja-build
+          else
+            brew install ninja || true
+          fi
+
+      - name: 选择编译器
+        if: matrix.cc != ''
+        run: echo "CC=${{ matrix.cc }}" >> "$GITHUB_ENV"; echo "CXX=${{ matrix.cxx }}" >> "$GITHUB_ENV"
+
+      - name: 配置
+        run: cmake -S . -B build ${{ matrix.generator }} -DCMAKE_BUILD_TYPE=Debug -DMB_WARNINGS_AS_ERRORS=ON
+
+      - name: 编译
+        run: cmake --build build --parallel
+
+      - name: 单元测试（CTest）
+        run: ctest --test-dir build --output-on-failure
+
+      - name: 运行示例
+        run: |
+          ./build/bin/example_01_basic_pubsub
+          ./build/bin/example_02_wildcards_filter
+          ./build/bin/example_03_lvgl_motor_sensor
+          ./build/bin/example_04_node_events
+        shell: bash
+
+  # ---------------------------------------------------------------------------
+  # Sanitizer：ASan + UBSan 抓内存与未定义行为问题
+  # （MSYS2 的 MinGW 不带 libsanitizer，所以只在 Linux 上跑）
+  # ---------------------------------------------------------------------------
+  sanitizers:
+    name: Linux (ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装构建工具
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: 配置
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DMB_BUILD_EXAMPLES=OFF \
+            -DMB_WARNINGS_AS_ERRORS=ON \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: 编译
+        run: cmake --build build --parallel
+
+      - name: 单元测试
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  # 交叉编译冒烟测试：确认 freertos / none 两个 port 至少能编译
+  # ---------------------------------------------------------------------------
+  ports:
+    name: 交叉 port 编译（freertos / none）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装构建工具
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      # 用 stub 头文件模拟 FreeRTOS，只验证 port 源码本身语法正确
+      - name: 生成 FreeRTOS 头文件桩
+        run: |
+          mkdir -p /tmp/freertos-stub
+          cat > /tmp/freertos-stub/projdefs.h <<'EOF'
+          #ifndef PROJDEFS_H
+          #define PROJDEFS_H
+          #define pdTRUE  1
+          #define pdFALSE 0
+          typedef int BaseType_t;
+          #endif
+          EOF
+          cat > /tmp/freertos-stub/portmacro.h <<'EOF'
+          #ifndef PORTMACRO_H
+          #define PORTMACRO_H
+          #include <stdint.h>
+          #define portTICK_PERIOD_MS 1u
+          #define portMAX_DELAY      ((TickType_t)0xFFFFFFFFu)
+          #define pdMS_TO_TICKS(ms)  ((TickType_t)(ms))
+          typedef uint32_t TickType_t;
+          #endif
+          EOF
+          cat > /tmp/freertos-stub/FreeRTOS.h <<'EOF'
+          #ifndef FREERTOS_H
+          #define FREERTOS_H
+          #include <stddef.h>
+          #include "projdefs.h"
+          #include "portmacro.h"
+          #define configUSE_RECURSIVE_MUTEXES      1
+          #define configSUPPORT_DYNAMIC_ALLOCATION 1
+          #define configTICK_RATE_HZ               1000
+          typedef void *TaskHandle_t;
+          void *pvPortMalloc(size_t size);
+          void  vPortFree(void *p);
+          void  vTaskDelay(TickType_t ticks);
+          TickType_t xTaskGetTickCount(void);
+          #endif
+          EOF
+          cat > /tmp/freertos-stub/semphr.h <<'EOF'
+          #ifndef SEMPHR_H
+          #define SEMPHR_H
+          #include "FreeRTOS.h"
+          typedef void *SemaphoreHandle_t;
+          SemaphoreHandle_t xSemaphoreCreateRecursiveMutex(void);
+          BaseType_t xSemaphoreTakeRecursive(SemaphoreHandle_t s, TickType_t timeout);
+          BaseType_t xSemaphoreGiveRecursive(SemaphoreHandle_t s);
+          void vSemaphoreDelete(SemaphoreHandle_t s);
+          #endif
+          EOF
+          ls /tmp/freertos-stub
+
+      - name: 配置（FreeRTOS port）
+        run: |
+          cmake -S . -B build-freertos -G Ninja \
+            -DMB_OS=freertos \
+            -DMB_FREERTOS_INCLUDE_DIR=/tmp/freertos-stub \
+            -DMB_BUILD_TESTS=OFF -DMB_BUILD_EXAMPLES=OFF \
+            -DMB_WARNINGS_AS_ERRORS=ON
+
+      - name: 编译（FreeRTOS port）
+        run: cmake --build build-freertos --parallel
+
+      - name: 配置 + 编译（裸机 port）
+        run: |
+          cmake -S . -B build-none -G Ninja \
+            -DMB_OS=none \
+            -DMB_BUILD_TESTS=OFF -DMB_BUILD_EXAMPLES=OFF \
+            -DMB_WARNINGS_AS_ERRORS=ON
+          cmake --build build-none --parallel
+
+  # ---------------------------------------------------------------------------
+  # 安装 / find_package 冒烟测试：确认导出配置可用
+  # ---------------------------------------------------------------------------
+  install:
+    name: 安装与 find_package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装构建工具
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: 构建并安装到临时前缀
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DMB_BUILD_TESTS=OFF -DMB_BUILD_EXAMPLES=OFF
+          cmake --build build --parallel
+          cmake --install build --prefix "$PWD/_install"
+
+      - name: 用 find_package 消费安装好的库
+        run: |
+          mkdir -p /tmp/consumer && cd /tmp/consumer
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.16)
+          project(consumer C)
+          find_package(message_bus 1.0 REQUIRED)
+          add_executable(consumer main.c)
+          target_link_libraries(consumer PRIVATE message_bus::message_bus)
+          EOF
+          cat > main.c <<'EOF'
+          #include <message_bus/message_bus.h>
+          #include <stdio.h>
+          int main(void)
+          {
+              mb_bus_t *bus = NULL;
+              if (mb_bus_create("consumer", &bus) != MB_OK) return 1;
+              printf("bus '%s' ok, version %s\n", mb_bus_name(bus), MB_VERSION_STRING);
+              mb_bus_destroy(bus);
+              return 0;
+          }
+          EOF
+          cmake -S . -B build -G Ninja -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/_install"
+          cmake --build build --parallel
+          ./build/consumer

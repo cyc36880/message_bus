@@ -1,0 +1,86 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 19, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "MB_BUILD_EXAMPLES": "ON",
+        "MB_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug（默认，含示例与测试）",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "release",
+      "displayName": "Release（-O2）",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "werror",
+      "displayName": "严格告警（-Wall -Wextra -Wpedantic -Werror）",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MB_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "lib-only",
+      "displayName": "只编译库（供 MCU 工程集成时验证）",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "MB_BUILD_EXAMPLES": "OFF",
+        "MB_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "shared",
+      "displayName": "动态库",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "MB_BUILD_SHARED": "ON"
+      }
+    },
+    {
+      "name": "freertos-cross",
+      "displayName": "交叉编译到 FreeRTOS（需自行提供工具链与 FreeRTOS 头文件）",
+      "description": "还需在命令行追加 -DCMAKE_TOOLCHAIN_FILE=<toolchain>.cmake 与 -DMB_FREERTOS_INCLUDE_DIR=<FreeRTOS-Kernel/include>",
+      "inherits": "lib-only",
+      "cacheVariables": { "MB_OS": "freertos" }
+    },
+    {
+      "name": "baremetal",
+      "displayName": "裸机 / 无 RTOS",
+      "inherits": "lib-only",
+      "cacheVariables": { "MB_OS": "none" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "werror", "configurePreset": "werror" },
+    { "name": "lib-only", "configurePreset": "lib-only" },
+    { "name": "shared", "configurePreset": "shared" }
+  ],
+  "testPresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "stopOnFailure": false }
+    },
+    { "name": "debug", "configurePreset": "debug", "inherits": "base" },
+    { "name": "release", "configurePreset": "release", "inherits": "base" },
+    { "name": "werror", "configurePreset": "werror", "inherits": "base" }
+  ]
+}

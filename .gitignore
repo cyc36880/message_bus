@@ -1,0 +1,49 @@
+# ── 构建产物 ─────────────────────────────────────────────────────────────
+build/
+build-*/
+out/
+cmake-build-*/
+install/
+_install/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+*.cmake.stamp
+
+# ── 编辑器 / IDE ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.clangd/
+.cache/
+
+# ── 编译中间文件 ─────────────────────────────────────────────────────────
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.elf
+*.bin
+*.hex
+*.map
+*.d
+*.gcda
+*.gcno
+*.gcov
+
+# ── 其它 ─────────────────────────────────────────────────────────────────
+compile_commands.json
+Doxyfile.generated
+*.log

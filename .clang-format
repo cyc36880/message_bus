@@ -1,0 +1,35 @@
+# 与 LVGL 代码风格保持接近：4 空格缩进、大括号不换行、100 列。
+# 用法：
+#   clang-format -i include/message_bus/*.h src/*.c port/*.c examples/*.c tests/*.c
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+
+AlignAfterOpenBracket: Align
+AlignConsecutiveAssignments: Consecutive
+AlignConsecutiveMacros: Consecutive
+AlignTrailingComments: true
+
+PointerAlignment: Right
+SpaceAfterCStyleCast: false
+SpacesBeforeTrailingComments: 1
+BinPackArguments: true
+BinPackParameters: true
+
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+
+# 中文字符按显示宽度计算，避免注释被过早折断
+ReflowComments: false

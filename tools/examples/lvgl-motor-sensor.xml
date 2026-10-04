@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 由「消息总线设计器」生成；schema 版本 1.1.0，对应 message_bus 1.0.0 -->
+<message-bus-design version="1.1.0">
+  <meta>
+    <title>LVGL / 电机 / 传感器解耦（对应 examples/03）</title>
+    <comment>三个节点互为陌生人：界面只认主题名，传感器只管上报，电机只认 motor/cmd。&#10;换平台时把 motor 的回调换成 HAL、把 sensor 的定时发布换成 ADC 即可，其余不动。</comment>
+  </meta>
+
+  <bus name="app">
+    <comment>主应用总线。PC 模拟器与 MCU 固件跑的是同一份代码，只有 OS 抽象层不同。</comment>
+    <node name="sensor">
+      <comment>ADC 采样任务。只往 sensor/... 发数据，不关心有没有界面在听。&#10;注意：回调在发布者线程里同步执行，所以 UI 相关处理要留给 LVGL 线程。</comment>
+      <publish topic="sensor/temp/value" payload="23.4" retain="true">
+        <comment>用 retained：界面比传感器后启动时，subscription 返回前就能立刻拿到当前值，不用等下一次采样。</comment>
+      </publish>
+      <publish topic="sensor/humi/value" payload="55.0" retain="true">
+        <comment>同上。</comment>
+      </publish>
+    </node>
+    <node name="motor">
+      <comment>电机控制节点。真实工程里这里换成 PWM / GPIO / 编码器驱动。</comment>
+      <publish topic="motor/speed/status" payload="0 rpm" retain="true">
+        <comment>状态类消息用 retained，否则后启动的界面会一直显示 (no data)。</comment>
+      </publish>
+      <subscribe filter="motor/cmd">
+        <comment>命令类消息**不要**用 retained：否则后加入的订阅者会重放一条早就过期的命令。&#10;这就是 examples/03 里 ui_button_set_speed() 传 flags = 0 的原因。</comment>
+      </subscribe>
+    </node>
+    <node name="lvgl_ui">
+      <comment>LVGL 界面节点。只订阅，不发布任何硬件相关的东西。&#10;重要：不要在回调里直接调用 lv_label_set_text()——回调跑在发布者线程，而 LVGL 不是线程安全的。&#10;推荐做法：回调只写变量/环形缓冲，由 LVGL 线程定时刷新；或 lv_async_call() 抛回 UI 线程。</comment>
+      <publish topic="motor/cmd" payload="speed=1200">
+        <comment>按钮事件：发命令给电机节点，而不是直接调用电机驱动。等价写法 mb_node_publish_to(ui, &quot;motor&quot;, &quot;cmd&quot;, ...)。</comment>
+      </publish>
+      <subscribe filter="sensor/+/value">
+        <comment>&apos;+&apos; 恰好匹配一层：sensor/temp/value 和 sensor/humi/value 都会命中；&#10;但 sensor/room1/temp/value 不会（那是三层）。</comment>
+      </subscribe>
+      <subscribe filter="motor/+/status">
+        <comment>同上，电机状态。</comment>
+      </subscribe>
+    </node>
+  </bus>
+
+</message-bus-design>

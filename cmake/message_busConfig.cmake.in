@@ -1,0 +1,12 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# POSIX 端口依赖 pthread；Windows/FreeRTOS/裸机端口不需要。
+if("@MB_OS_RESOLVED@" STREQUAL "posix")
+    find_dependency(Threads)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/message_busTargets.cmake")
+
+check_required_components(message_bus)
