@@ -175,7 +175,15 @@ jobs:
           typedef void *TaskHandle_t;
           void *pvPortMalloc(size_t size);
           void  vPortFree(void *p);
-          void  vTaskDelay(TickType_t ticks);
+          #endif
+          EOF
+          # 真实 FreeRTOS 把 vTaskDelay / xTaskGetTickCount 声明在 task.h，
+          # port 源码也按这个布局 #include "task.h"，桩必须提供该头文件。
+          cat > /tmp/freertos-stub/task.h <<'EOF'
+          #ifndef TASK_H
+          #define TASK_H
+          #include "FreeRTOS.h"
+          void       vTaskDelay(TickType_t ticks);
           TickType_t xTaskGetTickCount(void);
           #endif
           EOF
