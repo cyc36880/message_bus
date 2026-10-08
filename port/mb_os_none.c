@@ -90,6 +90,69 @@ void mb_os_mutex_destroy(mb_mutex_t *mutex)
     MB_CONFIG_FREE(mutex);
 }
 
+/* -------------------------------------------------------------------------
+ * 计数信号量：裸机下**无法阻塞**
+ *
+ * 没有调度器就没有「让出 CPU 再被唤醒」这回事，所以：
+ *   - 计数为正时照常减一并返回 true；
+ *   - 计数为 0 时立刻返回 false —— 即使传进来的是 MB_WAIT_FOREVER。
+ *
+ * 后果：异步发布在「主题条目满」时不会等待，而是直接返回 MB_ERR_TIMEOUT
+ * （计入 stats.async_dropped）。裸机上请把 timeout_ms 传 0，并在主循环里
+ * 反复调用 mb_bus_pump()，用「满了就丢/覆盖」的策略代替阻塞。
+ * 若确实需要阻塞语义，请改用 FreeRTOS 或其它 RTOS 的 port。
+ * ---------------------------------------------------------------------- */
+
+mb_sem_t *mb_os_sem_create(uint32_t initial, uint32_t max)
+{
+    mb_sem_t *sem;
+
+    if (max == 0 || initial > max) {
+        return NULL;
+    }
+
+    sem = (mb_sem_t *)MB_CONFIG_MALLOC(sizeof(*sem));
+    if (sem == NULL) {
+        return NULL;
+    }
+    sem->none.count = initial;
+    sem->none.max = max;
+    return sem;
+}
+
+bool mb_os_sem_wait(mb_sem_t *sem, uint32_t timeout_ms)
+{
+    bool acquired = false;
+
+    (void)timeout_ms; /* 裸机下无法等待，超时参数被忽略 */
+
+    MB_CONFIG_CRITICAL_ENTER();
+    if (sem->none.count > 0) {
+        sem->none.count--;
+        acquired = true;
+    }
+    MB_CONFIG_CRITICAL_EXIT();
+    return acquired;
+}
+
+bool mb_os_sem_signal(mb_sem_t *sem)
+{
+    bool signaled = false;
+
+    MB_CONFIG_CRITICAL_ENTER();
+    if (sem->none.count < sem->none.max) {
+        sem->none.count++;
+        signaled = true;
+    }
+    MB_CONFIG_CRITICAL_EXIT();
+    return signaled;
+}
+
+void mb_os_sem_destroy(mb_sem_t *sem)
+{
+    MB_CONFIG_FREE(sem);
+}
+
 uint32_t mb_os_time_ms(void)
 {
     return (uint32_t)MB_CONFIG_TIME_MS();

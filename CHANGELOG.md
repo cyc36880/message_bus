@@ -5,9 +5,81 @@
 
 ## [未发布]
 
+### 新增
+
+- **异步投递（`mb_async.h`）**。此前投递一律是同步的：回调在**发布者线程**上跑，
+  所以跨线程发消息时，接收方得先把数据转存进中转缓冲、再在自己的线程里取出来处理，
+  消息一多就很别扭。现在发布方可以只入队：
+
+  ```c
+  mb_node_publish_async(sensor, "sensor/temp/value", buf, len, NULL, MB_WAIT_NONE);
+  /* 任意线程（通常独占一个）驱动队列，回调就在这里跑 */
+  mb_bus_pump(bus);
+  ```
+
+  回调走的是**同步投递那条同一路径**（`mb_dispatch_message()`），所以订阅语义、
+  retained 补发、引用计数保护、递归深度保护全部自动一致 —— **订阅端一行都不用改**。
+
+- **队列是两级的**：总线上一张主题条目表，每个条目自带一条 FIFO。
+  `"a/b"` 与 `"a/c"` 是两个条目，互不挤占；往 `"a/b"` 连发内容 1、2
+  则只在 `a/b` 这一个条目里积压两条。
+
+- **满队列的两种策略**：
+
+  | 策略 | 打开方式 | 行为 |
+  |---|---|---|
+  | 等待（默认） | — | 最多等 `timeout_ms`，`MB_WAIT_FOREVER` 永久等；超时返回 `MB_ERR_TIMEOUT` |
+  | 覆盖最旧 | `MB_PUB_FLAG_ASYNC_OVERWRITE` 或 `MB_CONFIG_ASYNC_OVERWRITE_OLDEST = 1` | 丢弃该主题最旧的一条，永不阻塞 |
+
+  编译期默认 + 单次发布覆盖，因为状态类主题（传感器当前值）适合覆盖、
+  命令类主题（`motor/cmd`）绝不能覆盖。
+
+- **新 API**：`mb_node_publish_async()`、`mb_node_publish_to_async()`、
+  `mb_bus_publish_async()`、`mb_bus_pump()`、`mb_bus_async_pending()`、
+  `mb_bus_async_topic_count()`。同步 API 签名**未变**。
+
+- **`mb_os.h` 新增计数信号量**（`mb_os_sem_create/wait/signal/destroy`），
+  四个 port 全部实现。POSIX 用手搓的条件变量信号量而非 `sem_t` ——
+  因为 `sem_timedwait()` 是可选项，**macOS 至今没有实现**。
+
+- **新配置项**：`MB_CONFIG_ASYNC_MAX_TOPICS`（默认 16，**设为 0 可在编译期
+  完全去掉异步功能，不占任何 RAM**）、`MB_CONFIG_ASYNC_QUEUE_DEPTH`（默认 4）、
+  `MB_CONFIG_ASYNC_OVERWRITE_OLDEST`（默认 0）。
+
+- **新统计字段**：`async_enqueued`、`async_dropped`、`async_overwritten`。
+
+- **`tests/test_async.c`**：17 个用例 / 225 条断言，覆盖两级队列的独立性与 FIFO、
+  非阻塞 pump、满队列的等待/超时/覆盖三条路径、深拷贝、retained 语义、
+  回调线程归属，以及「4 个生产者线程 + 1 个 pump 线程」的背压
+  （生产者 `MB_WAIT_FOREVER`，一条都不许丢）。
+
 ### 修复
 
-- **兼容 Arduino / PlatformIO（ESP32）**。此前 `MB_CONFIG_OS = MB_OS_FREERTOS`
+- **补上 `mb_err_to_string()` 的实现**。它从 1.0.0 起就声明在 `mb_types.h` 里，
+  但**从未在任何源文件中定义过** —— 任何调用它的用户代码都会撞上
+  `undefined reference to mb_err_to_string`。现在实现在 `src/mb_log.c`，
+  并补上了 `MB_ERR_TIMEOUT` 一项。
+- **修正 `mb_async.c` 覆盖策略的空位记账错误**（本版本新增的代码，在测试中发现）：
+  覆盖最旧消息时只推进了队头却没有递减 `count`，导致该主题队列的
+  `count` 比实际多 1，第二次覆盖就会越界写入。已在 `entry->count--` 处修正。
+
+### 兼容性
+
+- **版本升到 1.1.0**。`mb_node_publish()` 等**同步 API 的签名与语义完全未变**，
+  新增的异步 API 是一族并行的 `_async` 函数，订阅端代码一行都不用改。
+- ⚠️ **`mb_bus_stats_t` 末尾追加了 3 个字段**。这对**源码**兼容（用
+  `mb_bus_get_stats()` 取值即可），但对**预编译二进制**是 ABI 破坏：
+  旧版库编译的调用方若把这个结构体按旧尺寸分配在栈上，会短 24 字节。
+  请连同库一起重新编译。
+- **自建 port 若要支持异步投递，需要补 4 个函数**。`mb_os.h` 新增了计数信号量
+  `mb_os_sem_create/wait/signal/destroy`（各约 5 行，仓库内四个 port 已全部实现，可照抄）。
+  **不用异步投递则不必补** —— 把这四个函数的调用全部包在
+  `#if MB_CONFIG_ASYNC_MAX_TOPICS > 0` 之内，所以把该宏设为 0 时
+  `mb_async.c` 整个编译为空，不会产生对这四个符号的引用
+  （已用 `nm` 验证目标文件里没有相关的未定义符号）。
+- **FreeRTOS 用户注意**：异步投递需要 `configUSE_COUNTING_SEMAPHORES = 1`，
+  没打开时编译期直接 `#error`（而不是到运行期才出问题）。
+
   时直接 `#include "FreeRTOS.h"`，而 Arduino-ESP32 / ESP-IDF 的头文件位于
   `freertos/` 子目录，导致编译报 `FreeRTOS.h: No such file or directory`。
   现在 `mb_os.h` 与 `mb_os_freertos.c` 用 `__has_include` 自动探测两种布局

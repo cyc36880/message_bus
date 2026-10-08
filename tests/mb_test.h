@@ -84,5 +84,6 @@ const mb_test_suite_t *mb_suite_topic(void);
 const mb_test_suite_t *mb_suite_bus(void);
 const mb_test_suite_t *mb_suite_pubsub(void);
 const mb_test_suite_t *mb_suite_threads(void);
+const mb_test_suite_t *mb_suite_async(void);
 
 #endif /* MB_TEST_H */

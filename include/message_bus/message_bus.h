@@ -14,6 +14,7 @@
 #ifndef MESSAGE_BUS_H
 #define MESSAGE_BUS_H
 
+#include "mb_async.h"
 #include "mb_bus.h"
 #include "mb_config.h"
 #include "mb_log.h"

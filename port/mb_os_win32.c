@@ -52,6 +52,49 @@ void mb_os_mutex_destroy(mb_mutex_t *mutex)
     free(mutex);
 }
 
+mb_sem_t *mb_os_sem_create(uint32_t initial, uint32_t max)
+{
+    mb_sem_t *sem;
+
+    /* Win32 的信号量计数上限是 LONG_MAX，超了直接判非法 */
+    if (max == 0 || max > 0x7FFFFFFFu || initial > max) {
+        return NULL;
+    }
+
+    sem = (mb_sem_t *)malloc(sizeof(*sem));
+    if (sem == NULL) {
+        return NULL;
+    }
+    sem->win32 = CreateSemaphore(NULL, (LONG)initial, (LONG)max, NULL);
+    if (sem->win32 == NULL) {
+        free(sem);
+        return NULL;
+    }
+    return sem;
+}
+
+bool mb_os_sem_wait(mb_sem_t *sem, uint32_t timeout_ms)
+{
+    DWORD wait = (timeout_ms == MB_WAIT_FOREVER) ? INFINITE : (DWORD)timeout_ms;
+
+    return WaitForSingleObject(sem->win32, wait) == WAIT_OBJECT_0;
+}
+
+bool mb_os_sem_signal(mb_sem_t *sem)
+{
+    /* 计数已达上限时 ReleaseSemaphore 返回 FALSE（GetLastError = ERROR_TOO_MANY_POSTS） */
+    return ReleaseSemaphore(sem->win32, 1, NULL) != 0;
+}
+
+void mb_os_sem_destroy(mb_sem_t *sem)
+{
+    if (sem == NULL) {
+        return;
+    }
+    CloseHandle(sem->win32);
+    free(sem);
+}
+
 uint32_t mb_os_time_ms(void)
 {
     return (uint32_t)GetTickCount64();

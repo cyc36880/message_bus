@@ -21,8 +21,9 @@
 - [5. 主题工具 `mb_topic.h`](#5-主题工具-mb_topich)
 - [6. 日志 `mb_log.h`](#6-日志-mb_logh)
 - [7. 消息与标志位 `mb_types.h`](#7-消息与标志位-mb_typesh)
-- [8. 版本 `mb_version.h`](#8-版本-mb_versionh)
-- [9. 最小可运行示例](#9-最小可运行示例)
+- [8. 异步投递 `mb_async.h`](#8-异步投递-mb_asynch)
+- [9. 版本 `mb_version.h`](#9-版本-mb_versionh)
+- [10. 最小可运行示例](#10-最小可运行示例)
 
 ---
 
@@ -40,6 +41,7 @@ typedef enum mb_err {
     MB_ERR_STATE        = -7,  /* 对象状态不允许该操作（如总线正在销毁） */
     MB_ERR_TOO_LONG     = -8,  /* 超过配置的长度上限 */
     MB_ERR_UNSUPPORTED  = -9,  /* 当前平台/配置不支持（如 qos != 0） */
+    MB_ERR_TIMEOUT      = -10, /* 异步发布时队列满，等到超时仍没有空位 */
 } mb_err_t;
 
 const char *mb_err_to_string(mb_err_t err);   /* → "MB_ERR_NOT_FOUND" */
@@ -107,6 +109,9 @@ printf("发布 %llu 条，投递 %llu 次，无人订阅 %llu，丢弃 %llu\n",
 | `retained_stored` | 当前 retained 条目数 | 用来估内存占用 |
 | `nodes_created` | 累计创建节点数（含已销毁） | — |
 | `peak_subscriptions` | 订阅数历史峰值 | 用来给静态内存池定容 |
+| `async_enqueued` | 累计成功进入异步队列的条数 | 与 `published` 对照，看有多少走了异步 |
+| `async_dropped` | 因队列满、等待超时没能入队的条数 | **不为 0 就是真丢了消息**，要么加大队列/超时，要么改用覆盖策略 |
+| `async_overwritten` | 因「覆盖最旧」被顶掉的旧消息条数 | 覆盖是刻意丢的；偏高说明消费端跟不上生产端 |
 
 > ⚠️ `mb_bus_find_node()` 返回的是**借用指针**：只要没有其它线程销毁该节点就一直有效。
 > 多线程下若可能并发销毁，请自行用外部机制保护，或改用
@@ -404,7 +409,8 @@ typedef struct mb_publish_opts {
 | 标志 | 效果 |
 |---|---|
 | `MB_PUB_FLAG_RETAIN` | 总线保存该主题最后一条；新订阅者会立刻收到。**空负载 = 清除保留** |
-| `MB_PUB_FLAG_SYNC` | 强制同步投递（当前版本恒为同步，此标志为语义显式化保留） |
+| `MB_PUB_FLAG_SYNC` | 强制同步投递（同步路径本来就是同步，此标志为语义显式化保留） |
+| `MB_PUB_FLAG_ASYNC_OVERWRITE` | 仅供异步发布：该主题队列满时**丢弃最旧的一条**而不是等待（见第 8 节） |
 
 ### 总线配置
 
@@ -429,14 +435,167 @@ typedef struct mb_bus_config {
 
 ---
 
-## 8. 版本 `mb_version.h`
+## 8. 异步投递 `mb_async.h`
+
+同步投递（`mb_node_publish()`）的回调在**发布者线程**上跑。异步投递把回调挪到
+**pump 线程**上，代价是消息要被深拷贝一份。设计原理与队列结构见
+[architecture.md 第 4.5 节](architecture.md#45-异步投递mb_asyncch)。
+
+> 编译期可以用 `MB_CONFIG_ASYNC_MAX_TOPICS 0` 完全去掉异步功能 ——
+> 此时下面所有函数都返回 `MB_ERR_UNSUPPORTED`（查询函数返回 0），
+> 并且不占用任何 RAM。默认是打开的（16 个主题 × 4 条）。
+
+### 发布
+
+```c
+mb_err_t mb_node_publish_async(mb_node_t *node, const char *topic,
+                               const void *payload, size_t payload_len,
+                               const mb_publish_opts_t *opts, uint32_t timeout_ms);
+mb_err_t mb_node_publish_to_async(mb_node_t *node, const char *dst_node,
+                                  const char *subtopic, const void *payload,
+                                  size_t payload_len, const mb_publish_opts_t *opts,
+                                  uint32_t timeout_ms);
+mb_err_t mb_bus_publish_async(mb_bus_t *bus, const char *topic,
+                              const void *payload, size_t payload_len,
+                              const mb_publish_opts_t *opts, uint32_t timeout_ms);
+```
+
+与同名同步 API 的**唯一**语义差异：
+
+1. 回调**不在本线程**执行，而是在调 `mb_bus_pump()` 的线程里执行；
+2. `topic` / `payload` / `source` 会被**深拷贝** —— 本函数返回后调用方
+   可以立刻释放/复用自己的缓冲区（同步投递是零拷贝的，没这个自由度）；
+3. 队列满时最多等 `timeout_ms`。
+
+其余完全一致：主题校验、retained 语义、错误码、无人订阅的统计。
+`msg->id` 与 `msg->timestamp_ms` 在**入队时**确定，不是投递时。
+
+`timeout_ms`：
+
+| 值 | 含义 |
+|---|---|
+| `MB_WAIT_NONE`（0） | 不等待，队列满立刻返回 `MB_ERR_TIMEOUT` |
+| `MB_WAIT_FOREVER`（`0xFFFFFFFFu`） | 永久等待，直到该主题腾出空位 |
+| 其它 | 最多等这么多毫秒 |
+
+| 返回值 | 含义 |
+|---|---|
+| `MB_OK` | 已进入队列 —— **不代表已被投递** |
+| `MB_ERR_TIMEOUT` | 队列满且等不到空位，本条已丢弃（计入 `async_dropped`） |
+| `MB_ERR_INVALID_ARG` / `MB_ERR_TOO_LONG` / `MB_ERR_UNSUPPORTED` | 与同步版本完全相同 |
+| `MB_ERR_NO_MEMORY` | 深拷贝失败 |
+| `MB_ERR_STATE` | 总线正在销毁 |
+
+```c
+/* 传感器任务：入队即返回，不再被刷屏拖慢 */
+if (mb_node_publish_async(sensor, "sensor/temp/value", buf, len, NULL, 10) != MB_OK) {
+    /* 注意：超时 = 这条消息真的丢了，不是"稍后重试" */
+}
+```
+
+**覆盖最旧**：置 `MB_PUB_FLAG_ASYNC_OVERWRITE`（或把编译期默认
+`MB_CONFIG_ASYNC_OVERWRITE_OLDEST` 设为 1），队列满时丢掉该主题里最旧的一条
+给新消息腾位置，永不阻塞。状态类主题（传感器当前值）适合覆盖；命令类主题
+绝不能覆盖。
+
+```c
+mb_publish_opts_t opts = { 0 };
+opts.flags = MB_PUB_FLAG_ASYNC_OVERWRITE;
+/* 只保留最新值：消费端慢的时候旧读数被顶掉，正是想要的 */
+mb_node_publish_async(sensor, "sensor/temp/value", buf, len, &opts, MB_WAIT_NONE);
+```
+
+> 覆盖只影响「**同一主题内**积压太多」，与主题条目总数无关：
+> `MB_CONFIG_ASYNC_MAX_TOPICS` 个条目名额用尽时，新主题仍然只能等（或超时）——
+> 否则会把别的主题挤掉，那就不叫「按主题分组」了。
+
+### 队列处理
+
+```c
+mb_err_t mb_bus_pump(mb_bus_t *bus);
+```
+
+取出队列里**当前积压的全部**消息，逐条投递给匹配的订阅者。
+这是异步队列的**唯一消费点**，也是异步订阅的回调真正被执行的地方。
+
+| 返回值 | 含义 |
+|---|---|
+| `MB_OK` | 正常处理完毕（队列本来就是空的时也返回 `MB_OK`） |
+| `MB_ERR_BUSY` | 另一个线程（或某个回调内）正在 pump |
+| `MB_ERR_STATE` | 总线正在销毁 |
+| `MB_ERR_UNSUPPORTED` | 编译期关闭了异步功能 |
+| `MB_ERR_INVALID_ARG` | `bus` 为 `NULL` |
+
+⚠️ **只允许在一个线程里调用**。两个线程同时 pump 会让同一个订阅者的回调被
+**并发进入**，而本库只承诺「不会重入同一条投递路径」，不承诺「回调之间互斥」。
+并发调用会被拒绝并返回 `MB_ERR_BUSY`，但那是给调试用的兜底，不是设计的一部分。
+
+⚠️ **本函数不阻塞**：队列空时立刻返回。请在专用线程里循环调用，
+两次之间自行 `mb_os_sleep_ms()`，否则空转烧 CPU。
+
+```c
+static void ui_task(void *arg)
+{
+    mb_bus_t *bus = arg;
+
+    for (;;) {
+        mb_bus_pump(bus);      /* 有消息就投递，没有就立刻返回 */
+        mb_os_sleep_ms(5);     /* 别空转 */
+    }
+}
+
+/* 也可以挂到 LVGL 的定时器上，回调就天然跑在 LVGL 线程里，可以直接碰控件 */
+lv_timer_create(pump_timer, 5, bus);
+```
+
+因为回调走的是**同步投递那条同一路径**，所以在回调里可以安全地
+`publish` / `subscribe` / `unsubscribe`（含取消自己）。
+
+### 查询
+
+```c
+size_t mb_bus_async_pending(const mb_bus_t *bus);      /* 还没投递的消息总条数 */
+size_t mb_bus_async_topic_count(const mb_bus_t *bus);  /* 当前占用的主题条目数 */
+```
+
+```c
+/* 检查泵线程是否跟得上：积压条数持续接近
+ * MB_CONFIG_ASYNC_MAX_TOPICS × MB_CONFIG_ASYNC_QUEUE_DEPTH 就该扩容或降频了 */
+printf("积压 %zu 条，占用 %zu 个主题\n",
+       mb_bus_async_pending(bus), mb_bus_async_topic_count(bus));
+```
+
+条目在**被取空后立刻回收**，所以空闲时 `mb_bus_async_topic_count()` 会回到 0。
+
+### 宏
+
+| 宏 | 默认 | 含义 |
+|---|---|---|
+| `MB_WAIT_NONE` | `0u` | 不等待 |
+| `MB_WAIT_FOREVER` | `0xFFFFFFFFu` | 永久等待 |
+
+### 关闭顺序
+
+`mb_bus_destroy()` **不会**唤醒阻塞在队列上的发布者（那样只会把一个安静睡着的
+线程变成正在解引用的线程）。所以销毁前必须先把所有线程 join 掉：
+
+```c
+/* ✅ 正确的关闭顺序 */
+g_pump_should_stop = true;
+thread_join(&pump_thread);
+mb_bus_destroy(bus);
+```
+
+---
+
+## 9. 版本 `mb_version.h`
 
 ```c
 #define MB_VERSION_MAJOR   1
-#define MB_VERSION_MINOR   0
+#define MB_VERSION_MINOR   1
 #define MB_VERSION_PATCH   0
-#define MB_VERSION_STRING  "1.0.0"
-#define MB_VERSION_NUMBER  ((1 << 16) | (0 << 8) | 0)
+#define MB_VERSION_STRING  "1.1.0"
+#define MB_VERSION_NUMBER  ((1 << 16) | (1 << 8) | 0)
 
 const char  *mb_version_string(void);   /* 运行期版本字符串 */
 unsigned int mb_version_number(void);   /* 运行期版本整数 */
@@ -444,7 +603,7 @@ unsigned int mb_version_number(void);   /* 运行期版本整数 */
 
 ---
 
-## 9. 最小可运行示例
+## 10. 最小可运行示例
 
 ```c
 #include <stdio.h>

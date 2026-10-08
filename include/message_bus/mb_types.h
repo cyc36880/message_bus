@@ -40,10 +40,23 @@ typedef enum mb_err {
     MB_ERR_STATE = -7,         /**< 对象状态不允许该操作（如总线正在销毁） */
     MB_ERR_TOO_LONG = -8,      /**< 字符串或数据超过配置上限 */
     MB_ERR_UNSUPPORTED = -9,   /**< 当前平台/配置不支持该功能 */
+    MB_ERR_TIMEOUT = -10,      /**< 等待超时（异步发布的队列满且等不到空位） */
 } mb_err_t;
 
 /** @return 错误码对应的英文短名，如 "MB_ERR_NOT_FOUND"。 */
 const char *mb_err_to_string(mb_err_t err);
+
+/* -------------------------------------------------------------------------
+ * 等待时间
+ *
+ * 凡是以 `timeout_ms` 为形参的 API 都用这两个值表达「不等待」与「永久等待」，
+ * 其余取值按毫秒解释。
+ * ---------------------------------------------------------------------- */
+
+/** 不等待：拿不到立刻返回（配合超时错误码使用）。 */
+#define MB_WAIT_NONE 0u
+/** 永久等待，直到拿到为止。 */
+#define MB_WAIT_FOREVER 0xFFFFFFFFu
 
 /* -------------------------------------------------------------------------
  * 消息
@@ -98,6 +111,14 @@ typedef void (*mb_handler_t)(mb_subscription_t *sub, const mb_message_t *msg, vo
  * 本条消息强制同步投递（当前版本恒为同步，该标志为兼容与语义显式化保留）。
  */
 #define MB_PUB_FLAG_SYNC (1u << 1)
+/**
+ * 仅对**异步发布**有效：本条消息所在的主题条目已满时，丢弃该条目里最旧的
+ * 一条来腾位置，而不是阻塞等待。等价于对这一次调用强制打开「覆盖最旧」，
+ * 覆盖 MB_CONFIG_ASYNC_OVERWRITE_OLDEST 的默认值。
+ *
+ * 同步发布忽略本标志。
+ */
+#define MB_PUB_FLAG_ASYNC_OVERWRITE (1u << 2)
 
 typedef struct mb_publish_opts {
     uint8_t flags; /**< MB_PUB_FLAG_* 组合，可为 0 */
@@ -131,6 +152,9 @@ typedef struct mb_bus_stats {
     uint64_t retained_stored;      /**< 当前 retained 表中的条目数 */
     uint64_t nodes_created;        /**< 累计创建的节点数（含已销毁） */
     uint64_t peak_subscriptions;   /**< 订阅表历史峰值 */
+    uint64_t async_enqueued;       /**< 累计成功进入异步队列的消息条数 */
+    uint64_t async_dropped;        /**< 因队列满、等待超时而没能入队的条数 */
+    uint64_t async_overwritten;    /**< 因「覆盖最旧」策略被丢弃的旧消息条数 */
 } mb_bus_stats_t;
 
 /* -------------------------------------------------------------------------

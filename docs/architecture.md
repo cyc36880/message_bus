@@ -40,19 +40,32 @@
 │                        message_bus（本库）                       │
 │                                                                  │
 │   mb_topic.c      MQTT 主题校验与通配符匹配（纯函数，可独立使用）  │
-│   mb_dispatch.c   ★ 唯一的投递出口：匹配 + 同步回调 + retained 补发│
+│   mb_dispatch.c   ★ 唯一的投递出口：匹配 + 回调 + retained 补发    │
+│   mb_async.c      异步队列 + pump（可选，MB_CONFIG_ASYNC_MAX_TOPICS）│
 │   mb_bus.c        总线生命周期、retained 表、系统主题             │
 │   mb_node.c       节点生命周期、发布、订阅                        │
 │   mb_subscription.c  订阅表与引用计数                             │
-│   mb_message.c    消息视图 / 深拷贝（仅 retained 用）             │
+│   mb_message.c    消息视图 / 深拷贝（retained 与异步队列共用）     │
 │   mb_log.c        分级日志                                        │
 └───────────────────────────┬──────────────────────────────────────┘
                             │ 只通过 mb_os.h 这一层
 ┌───────────────────────────▼──────────────────────────────────────┐
 │  port/:  mb_os_win32.c │ mb_os_posix.c │ mb_os_freertos.c │ none  │
-│          互斥量（递归锁） · 毫秒时间 · malloc/calloc/free          │
+│   互斥量（递归锁） · 计数信号量 · 毫秒时间 · malloc/calloc/free    │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+两条投递路径并存，但**汇合在同一个出口**：
+
+```
+mb_node_publish()        ──直接──┐
+                                 ├──► mb_dispatch_message()  ⟶ 订阅者回调
+mb_node_publish_async()  ──队列──┘         （投递语义完全相同）
+                              ▲
+                     mb_bus_pump()（专用线程）
+```
+
+所以「订阅」这件事不需要区分同步还是异步 —— 一份订阅代码，两种发布方式都能收到。
 
 分层的意义：**换平台只动最底下一层**。从 PC 模拟器切到 MCU，
 业务代码、总线代码、示例代码一行都不用改，只是编译列表里换一个 `.c` 文件
@@ -87,15 +100,22 @@ struct mb_bus {
     mb_bus_stats_t  stats;
     mb_bus_config_t config;
     bool            destroying;
+#if MB_CONFIG_ASYNC_MAX_TOPICS > 0
+    mb_async_pool_t async;          /* 异步队列；用到才分配（见 4.5） */
+    bool            pumping;        /* 保证只有一个线程在消费队列 */
+#endif
 };
 ```
 
-两点值得注意：
+三点值得注意：
 
 - **没有全局变量**。所有状态都挂在 `mb_bus_t` 上，因此可以同时存在多条互不干扰的
   总线（测试里就是这么用的）。代价是每个 API 都要先拿到 `bus` 指针。
 - **订阅表按 `seq` 升序**。`seq` 是单调递增的创建序号，这个顺序是投递算法的前提
   （见 4.1）。表是有序的，所以查找是 O(n) 线性扫描 —— 见第 6 节的性能讨论。
+- **异步队列是懒分配的**。`mb_bus_create()` 不碰它，第一次 `publish_async()` 才建。
+  不用异步投递的工程（也就是在此之前的全部用法）一个字节的 RAM 都不多花。
+  这与 retained 表「用到才分配」的做法一致。
 
 ### 3.2 节点 `mb_node_t`
 
@@ -245,6 +265,87 @@ subscribe("sensor/+/value")
 `mb_bus_destroy()` 销毁节点时**不再发布**下线事件 —— 总线正在关闭，
 此时发布没有意义，而且会在锁内触发投递路径。
 
+### 4.5 异步投递（`mb_async.c`）
+
+同步投递把回调算在**发布者**账上。异步投递把它挪到**另一个线程**：
+
+```
+发布者线程                                  pump 线程
+────────────                                ──────────
+publish_async() ──深拷贝──► [ "a/b": 1 2 ]
+                            [ "a/c": 7   ] ──► mb_bus_pump()
+                                                    │ 逐条取出
+                                                    ▼
+                                              mb_dispatch_message()
+                                              （订阅语义与同步完全一致）
+```
+
+**队列是两级的**，这是它最要紧的设计点：
+
+```
+bus->async.entries[]            每个条目一条定长环形 FIFO
+   ├── "a/b" ─► [ 1 ][ 2 ][   ][   ]     head  ──► 下一个出队位置
+   └── "a/c" ─► [ 7 ][   ][   ][   ]     count ──► 当前积压条数
+```
+
+> `"a/b"` 和 `"a/c"` 是两个**主题条目**；往 `"a/b"` 连发内容 1、2，
+> 则 `a/b` **这一个**条目里积压两条。
+> 一个主题积压再多也不会挤掉别的主题的位置 —— 这正是分两级、而不是用一条
+> 扁平队列的唯一理由。
+
+条目表容量 `MB_CONFIG_ASYNC_MAX_TOPICS`（默认 16），每条的 FIFO 深度
+`MB_CONFIG_ASYNC_QUEUE_DEPTH`（默认 4）。两个数字都必须小 —— 它们直接决定
+总线要预留多少堆。
+
+#### 满队列的两种策略
+
+| 策略 | 打开方式 | 行为 |
+|---|---|---|
+| **等**（默认） | `MB_PUB_FLAG_ASYNC_OVERWRITE` 不置位 | 阻塞最多 `timeout_ms`，`MB_WAIT_FOREVER` 永久等；超时返回 `MB_ERR_TIMEOUT` 并丢弃 |
+| **覆盖** | 该标志置位，或 `MB_CONFIG_ASYNC_OVERWRITE_OLDEST = 1` | 扔掉该主题里**最旧**的一条给新消息腾位置，永不阻塞 |
+
+状态类主题（传感器当前值）适合覆盖：消费端慢的时候只保留最新值。
+命令类主题（`motor/cmd`）绝不能覆盖 —— 丢一条就是丢一个动作。
+所以默认是「等」，覆盖必须显式打开，且可以按**单次发布**粒度选择。
+
+#### 信号量账本
+
+实现里最容易踩的坑在这里，改 `mb_async.c` 前务必看懂：
+
+| 信号量 | 计数恒等于 |
+|---|---|
+| `entry->space` | 该条目还剩几个空位 = `QUEUE_DEPTH - count` |
+| `pool->free_entries` | 还能新建几个主题条目 = `MAX_TOPICS - entry_count` |
+
+每次 push 消耗一个空位、每次 pop 归还一个；每次建条目消耗一个名额、
+每次释放条目归还一个。**任何一条路径漏掉或重复，队列就会凭空变满/变空，
+而且是静默的**（不会崩，只会永远收不到消息）。所以每个信号量操作要么断言结果，
+要么显式处理失败。
+
+还有一个必须用 `waiters` 计数器解决的 ABA 问题：发布者等空位时是在**锁外**
+阻塞的，如果此时 pump 把这条已经空掉的条目释放了，发布者醒来访问的就是
+已释放内存。因此只要还有一个发布者在等，条目就不许被回收
+（`entry_release_locked()` 里有断言把这件事钉死）。
+
+#### 为什么 pump 不阻塞
+
+`mb_bus_pump()` 取到队列空就返回，**它自己没有等待原语**。这带来两个好处：
+
+1. 调用方在两次 pump 之间可以干别的（刷 LVGL、睡一会儿），不必把线程
+   焊死在库的循环里；
+2. 库不创建线程、不需要「停止」语义 —— `mb_bus_destroy()` 之前用户
+   自己 join 掉 pump 线程即可，与库其余部分的契约完全一致（第 4 条优点）。
+
+代价是调用方要自己 `mb_os_sleep_ms()`，否则空转烧 CPU。
+
+#### 只允许一个 pump 线程
+
+`mb_bus_pump()` 用 `bus->pumping` 标志（锁内检查并置位）拒绝并发调用，
+返回 `MB_ERR_BUSY`。原因：两个线程同时 pump 会让**同一个订阅者的回调被并发进入**，
+而本库只承诺「不会重入同一条投递路径」，不承诺「回调之间互斥」。
+
+这个兜底是给调试用的，不是设计的一部分 —— 不要依赖它。
+
 ---
 
 ## 5. 线程与内存模型
@@ -329,8 +430,9 @@ retained 补发是例外 —— 那份数据由总线持有，但**同样只在�
    回调里可以随便调用总线 API 而不会死锁。
    调试时栈回溯直接能看到 `publish → handler`，不需要跨线程推理。
 
-4. **无隐藏资源**。库不创建线程、不开队列、不跑定时器。
-   所有资源在 `mb_bus_create()` 时分配，`mb_bus_destroy()` 时全部归还。
+4. **无隐藏资源**。库不创建线程、不跑定时器。异步队列是**用到才分配**的，
+   并且只分堆、不建线程 —— `mb_bus_pump()` 由用户自己的线程驱动。
+   所有资源在 `mb_bus_destroy()` 时全部归还。
    对 MCU 的 RAM 预算和启动时序都很友好。
 
 5. **retained 让「状态」和「事件」有了区分**。传感器当前值 / 电机当前转速是
@@ -338,8 +440,14 @@ retained 补发是例外 —— 那份数据由总线持有，但**同样只在�
    界面后启动时状态自动补齐，事件不会被重放 —— 这正好避开了
    「界面晚启动 3 秒，结果开机时按的那次按钮被重放一遍」的经典 bug。
 
-6. **投递收敛在一个函数里**。将来要改成异步（队列 + 分发线程），
-   只改 `mb_dispatch.c`，公开 API 一个都不用动。这是第 7 节里最重要的一条。
+6. **投递收敛在一个函数里**。异步投递（4.5）就是靠这条落地的：队列取出的消息
+   交给**同一个** `mb_dispatch_message()`，所以订阅语义、retained 补发、
+   引用计数保护、递归深度保护全部自动一致，一行都不用重写。
+
+   > 补一句诚实的复盘：当初在第 9 节里写「只改 `mb_dispatch.c`」，实际做完是
+   > **新增 `mb_async.c` + 给 OS 层加计数信号量 + 给 `mb_bus_t` 加两个字段**。
+   > 真正没错的是「投递语义不用动」这半句 —— 那才是省事的地方。
+   > 公开 API 也没有改，只是**新增**了一族 `_async`。
 
 ---
 
@@ -357,9 +465,16 @@ sensor 任务（1kHz 采样）──publish("sensor/temp")──► 5 个订阅�
 ```
 
 **什么时候不该用同步投递**：订阅者里有耗时操作（写 Flash、刷屏、等网络）。
-**怎么办**：让回调只做「把数据拷进环形缓冲」这一件事，
-真正的耗时处理交给消费方的任务在自己的节奏里做。
-`examples/03_lvgl_motor_sensor.c` 演示的就是这个模式。
+**两个办法**：
+
+1. 仍然用同步，但让回调只做「把数据拷进环形缓冲」这一件事，
+   真正的耗时处理交给消费方的任务在自己的节奏里做。
+   `examples/03_lvgl_motor_sensor.c` 演示的就是这个模式。
+2. **改用异步投递**（4.5）：`mb_node_publish_async()` 入队即返回，
+   回调改在 pump 线程上跑。发布方彻底不被拖累。
+
+方案 2 的代价是消息要**深拷贝**一份（同步投递是零拷贝的），
+而且投递时机变得不可控 —— 取决于 pump 线程什么时候被驱动。
 
 ### 7.2 锁竞争：单锁串行化一切
 
@@ -412,7 +527,7 @@ sensor 任务（1kHz 采样）──publish("sensor/temp")──► 5 个订阅�
 
 ### 8.1 LVGL 回调里不要直接碰控件 ⚠️ 最重要的一条
 
-LVGL **不是线程安全的**。而消息总线的回调是在**发布者线程**里执行的。
+LVGL **不是线程安全的**。而**同步**投递的回调是在**发布者线程**里执行的。
 如果传感器任务发布了 `sensor/temp/value`，界面订阅的回调就会在
 **传感器任务的线程**里被调用 —— 此时直接调 `lv_label_set_text()` 是在跨线程操作控件，
 轻则花屏，重则堆损坏崩溃。
@@ -449,16 +564,68 @@ static void on_temp(mb_subscription_t *sub, const mb_message_t *msg, void *user_
 
 `examples/03_lvgl_motor_sensor.c` 用的是做法 1。
 
+#### ✅ 做法 3（推荐）：改用异步投递，让回调本来就跑在 LVGL 线程里
+
+上面两个做法都是在绕开「回调不在 LVGL 线程里」这个前提。
+**异步投递直接把这个前提消掉** —— 让 LVGL 的刷新定时器顺手驱动 pump：
+
+```c
+/* 发布方：传感器任务，任意线程。入队即返回，不再被刷屏拖慢 */
+mb_node_publish_async(sensor, "sensor/temp/value", buf, len, NULL, MB_WAIT_NONE);
+
+/* 消费方：pump 在 LVGL 线程里跑（lv_timer 回调里调一次即可） */
+static void pump_timer(lv_timer_t *t)
+{
+    mb_bus_pump(bus);      /* 有消息就投递，没有就立刻返回，不阻塞 UI 线程 */
+}
+
+/* 于是订阅回调天然运行在 LVGL 线程上，可以直接碰控件 —— 不需要任何中转 */
+static void on_temp(mb_subscription_t *sub, const mb_message_t *msg, void *user_data)
+{
+    lv_label_set_text(ui->temp_label, msg->payload);   /* ✅ 安全，这就是 4.5 的意义 */
+}
+```
+
+条件是**驱动 pump 的那个线程必须是唯一操作控件的线程**。`mb_bus_pump()`
+本身用 `bus->pumping` 兜底拒绝并发调用，但那是给调试用的 —— 设计上就该
+保证只有一个线程在 pump（见 4.5）。
+
+另外注意 `MB_WAIT_NONE` 与 `MB_WAIT_FOREVER` 的选择：在 LVGL 定时器里
+**绝不能**用 `MB_WAIT_FOREVER` 发布 —— 队列满时会阻塞 UI 线程；
+而如果 pump 也在同一个线程里，那就直接**死锁**了。用
+`MB_WAIT_NONE` + 覆盖策略，或者干脆让发布方是另一个线程。
+
 ### 8.2 不要在回调里做耗时操作
 
-回调阻塞的是**发布者**。在回调里 `vTaskDelay()`、等信号量、写 Flash，
-都会直接拖慢甚至卡死发布者的任务。回调应该尽量短。
+回调阻塞的是**驱动它的那个线程**：
+
+| 投递方式 | 回调在哪个线程上跑 |
+|---|---|
+| `mb_node_publish()` | 发布者 |
+| `mb_node_publish_async()` | 调 `mb_bus_pump()` 的那个线程 |
+
+在回调里 `vTaskDelay()`、等信号量、写 Flash，都会直接拖慢甚至卡死这个线程。
+异步投递只是**换了一个被拖慢的线程**，并没有让耗时操作变便宜 —— 但它至少
+把「传感器任务」和「刷屏」解耦了，这通常正是要的效果。回调仍应尽量短。
 
 ### 8.3 不要在回调里销毁总线
 
 `mb_bus_destroy()` 需要独占总线，在回调内调用会**死锁**（回调运行时仍持有引用，
 销毁路径等不到）。正确做法是由另一个任务在确认没有回调在跑之后再销毁。
 头文件里对此有 `@warning`。
+
+对异步投递来说这条要再强调一次：销毁总线前必须**先让 pump 线程停下来并 join**，
+否则 pump 线程可能在 `mb_bus_destroy()` 已经释放总线之后（或过程中）去访问它。
+库**不会**在销毁时去唤醒阻塞在队列上的发布者 —— 那样会把一个安静睡着的线程
+变成正在解引用的线程，只会让问题更难查。所以契约仍然是：
+**先 join 所有线程，再销毁总线**。
+
+```c
+/* ✅ 正确的关闭顺序 */
+g_pump_should_stop = true;
+thread_join(&pump_thread);
+mb_bus_destroy(bus);
+```
 
 ### 8.4 `#` 匹配不到 `$` 开头的主题
 
@@ -488,6 +655,12 @@ mb_node_publish(motor, "motor/speed/status", "1200 rpm", 8, &retain_opts);
 #define MB_CONFIG_MAX_PAYLOAD_SIZE 256   /* 默认 0（不限）—— 建议设上限 */
 #define MB_CONFIG_LOG_LEVEL       1      /* 量产关掉 INFO/DEBUG */
 #define MB_CONFIG_ENABLE_CHECKS   0      /* 量产省空间 */
+
+/* 不用异步投递就关掉，一个字节的 RAM 都不多花 */
+#define MB_CONFIG_ASYNC_MAX_TOPICS 0
+/* 要用的话把这两个数字压到刚好够用 —— 它们直接决定预留多少堆 */
+/* #define MB_CONFIG_ASYNC_MAX_TOPICS  8 */
+/* #define MB_CONFIG_ASYNC_QUEUE_DEPTH 2 */
 ```
 
 也可以把 `MB_CONFIG_MALLOC/CALLOC/FREE` 全部换成静态内存池，
@@ -504,7 +677,8 @@ mb_node_publish(motor, "motor/speed/status", "1200 rpm", 8, &retain_opts);
 | 其它 RTOS（RT-Thread 等） | 复制 `port/mb_os_none.c` 或 `mb_os_freertos.c` 改造成 `mb_os_xxx.c` |
 
 注意 `MB_OS_NONE` 下的 `mb_os_mutex_*` 不是真锁（用临界区宏模拟），
-只在「中断里也调总线 API」时需要特别小心 —— 详见 [porting.md](porting.md)。
+只在「中断里也调总线 API」时需要特别小心。**异步投递在裸机上无法真正阻塞**，
+满队列一律退化成 `MB_ERR_TIMEOUT` —— 详见 [porting.md](porting.md) 第 2.1 节。
 
 ---
 
@@ -514,11 +688,13 @@ mb_node_publish(motor, "motor/speed/status", "1200 rpm", 8, &retain_opts);
 
 | 想做什么 | 改哪里 | 公开 API 要变吗 |
 |---|---|---|
-| 改成异步投递（队列 + 分发线程） | `mb_dispatch.c` 一个文件 | 不用 |
+| ~~改成异步投递~~（**已完成**，见 4.5） | 新增 `mb_async.c`，投递仍走 `mb_dispatch.c` | 不用（只**新增**了 `_async` 一族） |
 | 加主题哈希索引提升匹配性能 | `mb_bus.c` 的订阅表 + `mb_dispatch.c` 的扫描 | 不用 |
-| 新增 RTOS 支持 | 新增 `port/mb_os_<os>.c`，实现 `mb_os.h` 的 7 个函数 | 不用 |
+| 新增 RTOS 支持 | 新增 `port/mb_os_<os>.c`，实现 `mb_os.h` 的 11 个函数 | 不用 |
 | 改内存策略（静态池 / TLSF） | `port/mb_os_*.c` 的 malloc/calloc/free | 不用 |
 | 支持 QoS 1/2 | `mb_message.c` + `mb_dispatch.c`（需要引入队列与重传） | `qos` 字段已预留 |
+
+> 异步投递那一行是事后补的：第 6 节第 6 条记了实际改动的范围与当初估计的偏差。
 
 `mb_bus_config_t` 结尾的 `void *reserved[4]` 就是为这类扩展预留的：
 新增配置项**追加在 reserved 之前**，老代码用 `mb_bus_default_config()` 初始化即可保持兼容。
@@ -539,9 +715,11 @@ mb_node_publish(motor, "motor/speed/status", "1200 rpm", 8, &retain_opts);
 | 会话保持 / 离线消息 | ✅ | 无 |
 | 共享订阅 `$share` | ✅ | 无 |
 | 跨设备 | ✅ | ❌ 进程内 |
-| 投递时机 | 异步（网络） | **同步**（调用返回即完成） |
+| 投递时机 | 异步（网络） | **两种都有**：`publish()` 同步（调用返回即完成），`publish_async()` + `mb_bus_pump()` 异步 |
 
 差异集中在「网络」相关的部分 —— 进程内没有网络，这些机制自然也就没有存在的基础。
+反过来，「异步」在进程内本来不是必需的，本库加它纯粹是为了**换线程**（4.5），
+不是为了补偿网络延迟。
 
 ---
 
@@ -550,5 +728,7 @@ mb_node_publish(motor, "motor/speed/status", "1200 rpm", 8, &retain_opts);
 - [api.md](api.md) —— 按模块的 API 参考与示例片段
 - [porting.md](porting.md) —— 移植到 FreeRTOS / 裸机 / 新平台，含任务骨架代码
 - [topics.md](topics.md) —— 主题与通配符规范、MQTT 对照表
+- `include/message_bus/mb_async.h` —— 异步投递的完整说明与使用骨架
 - `examples/03_lvgl_motor_sensor.c` —— 本项目的真实场景，含 LVGL 线程安全示范
 - `tests/test_pubsub.c` —— 发布订阅语义的完整测试，也是最好的行为说明
+- `tests/test_async.c` —— 异步队列的行为说明（含满队列、覆盖、并发 pump）

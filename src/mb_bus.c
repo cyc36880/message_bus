@@ -118,6 +118,20 @@ static void retained_clear_locked(mb_bus_t *bus, const char *topic)
     }
 }
 
+void mb_bus_retain_locked(mb_bus_t *bus, const mb_message_t *msg)
+{
+    MB_CONFIG_ASSERT(bus != NULL);
+    MB_CONFIG_ASSERT(msg != NULL);
+
+    /* MQTT 语义：空负载的 retained 发布用于清除该主题的保留消息，
+     * 但这条消息本身仍然正常投递给在线订阅者。 */
+    if (msg->payload_len == 0) {
+        retained_clear_locked(bus, msg->topic);
+    } else {
+        retained_store_locked(bus, msg);
+    }
+}
+
 /* -------------------------------------------------------------------------
  * 小节：生命周期
  * ---------------------------------------------------------------------- */
@@ -221,7 +235,10 @@ void mb_bus_destroy(mb_bus_t *bus)
     }
     bus->stats.retained_stored = 0;
 
-    /* 4. 释放容器。 */
+    /* 4. 释放异步队列（连同队列里还没被 pump 取走的消息）。 */
+    mb_async_pool_dispose(bus);
+
+    /* 5. 释放容器。 */
     mb_os_free(bus->nodes);
     mb_os_free(bus->subs);
     bus->nodes = NULL;
@@ -337,28 +354,24 @@ mb_err_t mb_bus_publish(mb_bus_t *bus,
     return mb_bus_publish_internal(bus, NULL, topic, payload, payload_len, opts);
 }
 
-mb_err_t mb_bus_publish_internal(mb_bus_t *bus,
-                                 const char *source,
-                                 const char *topic,
-                                 const void *payload,
-                                 size_t payload_len,
-                                 const mb_publish_opts_t *opts)
+mb_err_t mb_publish_prepare(const char *topic,
+                            const void *payload,
+                            size_t payload_len,
+                            const mb_publish_opts_t *opts,
+                            mb_publish_opts_t *out_opts,
+                            uint8_t *out_flags)
 {
-    mb_message_t msg;
-    mb_publish_opts_t options;
-    size_t delivered = 0;
     mb_err_t err;
 
-    if (bus == NULL) {
-        return MB_ERR_INVALID_ARG;
-    }
+    MB_CONFIG_ASSERT(out_opts != NULL);
+    MB_CONFIG_ASSERT(out_flags != NULL);
 
-    options.flags = 0;
-    options.qos = 0;
+    out_opts->flags = 0;
+    out_opts->qos = 0;
     if (opts != NULL) {
-        options = *opts;
+        *out_opts = *opts;
     }
-    if (options.qos != 0) {
+    if (out_opts->qos != 0) {
         /* 进程内总线不引入 QoS 1/2 的重传与确认机制，见 docs/architecture.md */
         return MB_ERR_UNSUPPORTED;
     }
@@ -377,11 +390,38 @@ mb_err_t mb_bus_publish_internal(mb_bus_t *bus,
     }
 #endif
 
+    /* 注意：发布选项**不**进入对外可见的 flags。
+     * MB_PUB_FLAG_RETAIN 与 MB_MSG_FLAG_RETAINED 恰好都是 1u<<0，
+     * 把 opts->flags 原样塞进去会让「实时收到的消息」被误判成 retained 补发。 */
+    *out_flags = mb_topic_is_system(topic) ? MB_MSG_FLAG_SYSTEM : 0;
+    return MB_OK;
+}
+
+mb_err_t mb_bus_publish_internal(mb_bus_t *bus,
+                                 const char *source,
+                                 const char *topic,
+                                 const void *payload,
+                                 size_t payload_len,
+                                 const mb_publish_opts_t *opts)
+{
+    mb_message_t msg;
+    mb_publish_opts_t options;
+    size_t delivered = 0;
+    mb_err_t err;
+
+    if (bus == NULL) {
+        return MB_ERR_INVALID_ARG;
+    }
+
+    err = mb_publish_prepare(topic, payload, payload_len, opts, &options, &msg.flags);
+    if (err != MB_OK) {
+        return err;
+    }
+
     msg.topic = topic;
     msg.payload = (payload_len > 0) ? payload : NULL;
     msg.payload_len = payload_len;
     msg.source = source;
-    msg.flags = mb_topic_is_system(topic) ? MB_MSG_FLAG_SYSTEM : 0;
 
     MB_BUS_LOCK(bus);
     if (bus->destroying) {
@@ -395,13 +435,7 @@ mb_err_t mb_bus_publish_internal(mb_bus_t *bus,
 
     if ((options.flags & MB_PUB_FLAG_RETAIN) != 0) {
         MB_BUS_LOCK(bus);
-        if (payload_len == 0) {
-            /* MQTT 语义：空负载的 retained 发布用于清除该主题的保留消息，
-             * 但这条消息本身仍然正常投递给在线订阅者。 */
-            retained_clear_locked(bus, topic);
-        } else {
-            retained_store_locked(bus, &msg);
-        }
+        mb_bus_retain_locked(bus, &msg);
         MB_BUS_UNLOCK(bus);
     }
 

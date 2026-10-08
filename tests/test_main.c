@@ -50,13 +50,14 @@ static int run_suite(const mb_test_suite_t *suite)
 
 int main(void)
 {
-    const mb_test_suite_t *suites[4];
+    const mb_test_suite_t *suites[5];
     size_t suite_count = 0;
     size_t i;
 
     suites[suite_count++] = mb_suite_topic();
     suites[suite_count++] = mb_suite_bus();
     suites[suite_count++] = mb_suite_pubsub();
+    suites[suite_count++] = mb_suite_async();
     suites[suite_count++] = mb_suite_threads();
 
     printf("message_bus unit tests\n");

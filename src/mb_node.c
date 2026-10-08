@@ -360,6 +360,53 @@ mb_err_t mb_node_publish_to(mb_node_t *node,
 }
 
 /* -------------------------------------------------------------------------
+ * 小节：异步发布
+ *
+ * 实现在 src/mb_async.c（含编译期关闭异步功能时的兜底）。这里只做与
+ * 同步版本完全对称的「取 bus + 作者名」这一步。
+ * ---------------------------------------------------------------------- */
+
+mb_err_t mb_node_publish_async(mb_node_t *node,
+                               const char *topic,
+                               const void *payload,
+                               size_t payload_len,
+                               const mb_publish_opts_t *opts,
+                               uint32_t timeout_ms)
+{
+    if (node == NULL || topic == NULL) {
+        return MB_ERR_INVALID_ARG;
+    }
+    return mb_bus_publish_async_internal(node->bus, node->name, topic, payload, payload_len,
+                                         opts, timeout_ms);
+}
+
+mb_err_t mb_node_publish_to_async(mb_node_t *node,
+                                  const char *dst_node,
+                                  const char *subtopic,
+                                  const void *payload,
+                                  size_t payload_len,
+                                  const mb_publish_opts_t *opts,
+                                  uint32_t timeout_ms)
+{
+    char topic[MB_CONFIG_MAX_TOPIC_LEN];
+    mb_err_t err;
+
+    if (node == NULL || dst_node == NULL) {
+        return MB_ERR_INVALID_ARG;
+    }
+    if (validate_node_name(dst_node) != MB_OK) {
+        return MB_ERR_INVALID_ARG;
+    }
+
+    err = mb_topic_build(topic, sizeof(topic), dst_node, subtopic);
+    if (err != MB_OK) {
+        return err;
+    }
+    return mb_bus_publish_async_internal(node->bus, node->name, topic, payload, payload_len,
+                                         opts, timeout_ms);
+}
+
+/* -------------------------------------------------------------------------
  * 小节：订阅
  * ---------------------------------------------------------------------- */
 

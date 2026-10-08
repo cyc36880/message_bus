@@ -1,6 +1,8 @@
 # 移植指南
 
-本库只需要平台提供 **7 个函数**：一把递归锁（4 个操作）、毫秒时间、内存分配（3 个）。
+本库只需要平台提供 **11 个函数**：一把递归锁（4 个操作）、一个计数信号量（4 个操作）、
+毫秒时间、内存分配（3 个）。信号量只为**异步投递**（`mb_async.h`）服务 ——
+把 `MB_CONFIG_ASYNC_MAX_TOPICS` 设为 0 关掉异步功能后，前 4 个函数就是全部。
 所有平台相关代码都收敛在 `port/` 下的**单个 `.c` 文件**里，换平台不需要改动 `src/` 任何一行。
 
 每个 port 文件都用 `#if MB_CONFIG_OS == MB_OS_XXX` 包住整个实现，**未被选中时编译为空目标文件**。
@@ -303,6 +305,8 @@ int main(void)
 | 优先级反转 | 总线锁是普通互斥量（`xSemaphoreCreateRecursiveMutex` 自带优先级继承）。回调运行在**发布者的优先级**上，低优先级任务发布时可能被其订阅者的工作量拖慢。 |
 | 堆 | 默认用 `pvPortMalloc`。若 `configSUPPORT_DYNAMIC_ALLOCATION = 0`，见第 5 节。 |
 | 不要在回调里 `vTaskDelay` | 阻塞的是发布者任务。回调应当尽量短。 |
+| 异步投递需要 `configUSE_COUNTING_SEMAPHORES = 1` | `mb_os_sem_*` 用 `xSemaphoreCreateCounting()` 实现。没打开这个开关时编译期会直接 `#error`，不会到运行期才炸。 |
+| 异步 API 需要调度器已启动 | 计数信号量在调度器启动前不能用，`mb_node_publish_async()` / `mb_bus_pump()` 必须在任务里调用（`mb_node_publish()` 则不受限）。 |
 
 ---
 
@@ -358,6 +362,32 @@ int main(void)
 #define MB_CONFIG_FREE(ptr)           my_pool_free(ptr)
 ```
 
+### 2.1 裸机上没有真正的阻塞
+
+`mb_os_sem_*` 在裸机下只能用临界区模拟计数，**无法让出一个执行流**。因此：
+
+| 场景 | 裸机上的实际行为 |
+|---|---|
+| `mb_node_publish_async(..., MB_WAIT_FOREVER)` | 退化成不等待；队列满时立刻返回 `MB_ERR_TIMEOUT` |
+| `mb_node_publish_async(..., 100)` | 同上（超时参数被忽略） |
+| 条目名额用尽时发布新主题 | 同上 |
+| `mb_bus_pump()` | 与其它平台一致（本来就不阻塞） |
+
+也就是说 **`MB_ERR_TIMEOUT` 在裸机上是常态而不是异常**，发布方必须每次都检查返回值。
+推荐二选一：
+
+```c
+/* 方案 A：状态类主题用覆盖，永不因为队列满而丢新值 */
+#define MB_CONFIG_ASYNC_OVERWRITE_OLDEST 1
+
+/* 方案 B：干脆关掉异步，回到同步投递（单线程裸机本来也不需要它） */
+#define MB_CONFIG_ASYNC_MAX_TOPICS 0
+```
+
+裸机上异步投递的价值本来就有限 —— 它解决的是「跨线程」，而裸机只有一个主循环。
+如果只是想让回调别在 ISR 里跑，`main()` 里 `mb_bus_pump()` 一次即可，
+队列深度给 1 就够。
+
 ---
 
 ## 3. PC 模拟器（`MB_OS_POSIX` / `MB_OS_WIN32`）
@@ -371,10 +401,15 @@ ctest --test-dir build --output-on-failure
 ./build/bin/example_03_lvgl_motor_sensor
 ```
 
-| 平台 | 锁 | 时间 | 内存 |
-|---|---|---|---|
-| POSIX | `pthread_mutex_t`，`PTHREAD_MUTEX_RECURSIVE` | `clock_gettime(CLOCK_MONOTONIC)` | `malloc` / `calloc` / `free` |
-| Win32 | `CRITICAL_SECTION`（天然可重入） | `GetTickCount64()` | 同上 |
+| 平台 | 锁 | 信号量 | 时间 | 内存 |
+|---|---|---|---|---|
+| POSIX | `pthread_mutex_t`，`PTHREAD_MUTEX_RECURSIVE` | `pthread_mutex_t` + `pthread_cond_t` 手搓计数信号量 | `clock_gettime(CLOCK_MONOTONIC)` | `malloc` / `calloc` / `free` |
+| Win32 | `CRITICAL_SECTION`（天然可重入） | `CreateSemaphore` + `WaitForSingleObject` | `GetTickCount64()` | 同上 |
+
+> POSIX 为什么手搓而不是用 `sem_t`？因为 `sem_timedwait()` 是 POSIX.1-2001 的可选项，
+> **macOS 至今没有实现**，而本库要能在 Mac 上编译。条件变量是普适的。
+> 注意 `pthread_cond_timedwait()` 默认走 `CLOCK_REALTIME`，所以超时时刻也用
+> `clock_gettime(CLOCK_REALTIME)` 算 —— 拿 `CLOCK_MONOTONIC` 去填会算出荒谬的等待时长。
 
 用 POSIX port 时需要链接 pthread（CMake 的 `Threads::Threads` 已自动处理）。
 手工编译时记得加 `-lpthread`。
@@ -383,7 +418,8 @@ ctest --test-dir build --output-on-failure
 
 ## 4. 新增一个 port（其它 RTOS）
 
-以 RT-Thread 为例。**只需实现 7 个函数**：
+以 RT-Thread 为例。**只需实现 7 个函数**（不用异步投递的话；用到异步还要再加 4 个
+信号量函数，见本节末尾）：
 
 ```c
 /* port/mb_os_rtthread.c */
@@ -448,7 +484,66 @@ void  mb_os_free(void *ptr)                 { rt_free(ptr); }
 typedef union mb_mutex {
     void *ptr;
 } mb_mutex_t;
+
+typedef union mb_sem {
+    rt_sem_t rtthread;
+} mb_sem_t;
 ```
+
+### 4.1 如果需要异步投递：再实现 4 个信号量函数
+
+`mb_os_sem_*` 必须是**计数信号量**（不是二值的），并且 `mb_os_sem_wait()`
+要支持带超时的等待。RT-Thread 上直接映射：
+
+```c
+mb_sem_t *mb_os_sem_create(uint32_t initial, uint32_t max)
+{
+    mb_sem_t *sem = (mb_sem_t *)rt_malloc(sizeof(*sem));
+
+    if (sem == NULL) return NULL;
+    if (max == 0 || initial > max) { rt_free(sem); return NULL; }
+
+    /* RT_IPC_FLAG_PRIO：等待者按优先级排队，不是 FIFO。库不依赖唤醒顺序。 */
+    sem->rtthread = rt_sem_create("mb", initial, RT_IPC_FLAG_PRIO);
+    if (sem->rtthread == RT_NULL) { rt_free(sem); return NULL; }
+    return sem;
+}
+
+bool mb_os_sem_wait(mb_sem_t *sem, uint32_t timeout_ms)
+{
+    rt_int32_t ticks;
+
+    if (sem == NULL) return false;
+    if (timeout_ms == MB_WAIT_FOREVER) {
+        ticks = RT_WAITING_FOREVER;
+    } else {
+        /* 向上取整：宁可多等不到一个 tick，也不能少等到 0（= 不等待）。
+         * 先除后补余数，不要写 (a + b - 1) / b —— timeout_ms 接近
+         * 0xFFFFFFFF 时那个加法会溢出，把大超时算成「立刻超时」。 */
+        uint32_t period = RT_TICK_PER_SECOND / 1000;
+        uint32_t whole  = timeout_ms / period;
+
+        ticks = (rt_int32_t)(whole + (((timeout_ms % period) != 0) ? 1 : 0));
+    }
+    return rt_sem_take(sem->rtthread, ticks) == RT_EOK;
+}
+
+bool mb_os_sem_signal(mb_sem_t *sem)
+{
+    if (sem == NULL) return false;
+    return rt_sem_release(sem->rtthread) == RT_EOK;
+}
+
+void mb_os_sem_destroy(mb_sem_t *sem)
+{
+    if (sem == NULL) return;
+    if (sem->rtthread != RT_NULL) rt_sem_delete(sem->rtthread);
+    rt_free(sem);
+}
+```
+
+`mb_os_sem_wait()` 返回 `false` 表示**超时**（不是错误）；调用方据此返回
+`MB_ERR_TIMEOUT`。`MB_WAIT_NONE`（0）表示不等待，必须立即返回当前是否拿得到。
 
 ### 移植检查清单
 
@@ -458,6 +553,10 @@ typedef union mb_mutex {
 - [ ] **没有实现/使用 `realloc`** —— 库刻意不用它，很多 RTOS 堆没有
 - [ ] 用 `#if MB_CONFIG_OS == ...` 包住整个实现（未选中时编译为空文件）
 - [ ] 跑通 `ctest` 里的 `threads` 套件（4 线程 × 500 条消息的并发测试）
+- [ ] 用到异步时：跑通 `async` 套件；`mb_os_sem_wait()` 的毫秒超时要**向上取整**成 tick
+      （向下取整会让 1ms 变成 0，退化成不等待）
+- [ ] 用到异步时：`mb_os_sem_signal()` 从**任意线程**调用都必须安全（`mb_bus_pump()`
+      会在锁内调用它来唤醒阻塞中的发布者）
 
 最后一条最重要 —— 它是唯一能真正验证「锁确实是对的」的手段，
 在 PC 上用 POSIX port 跑一遍，再上目标板。

@@ -86,6 +86,43 @@ struct mb_node {
 };
 
 /* -------------------------------------------------------------------------
+ * 异步队列：按主题分组的 FIFO
+ *
+ * 结构是**两级**的：总线上有一张主题条目表，每个条目自带一条固定深度的
+ * 环形队列。这样 "a/b" 上积压再多也不会挤掉 "a/c" 的位置。
+ *
+ * 信号量账本（是这套实现的关键，两条不变式必须同时成立）：
+ *   entry->space 的计数 == MB_CONFIG_ASYNC_QUEUE_DEPTH - entry->count
+ *     —— 每成功 push 一条就消耗一个空位，每 pop 一条就归还一个空位。
+ *   pool->free_entries 的计数 == entry_capacity - entry_count
+ *     —— 每建一个条目消耗一个名额，每释放一个条目归还一个。
+ * 任何一条路径漏掉一次消耗/归还，都会让队列凭空变满或凭空清空。
+ * ---------------------------------------------------------------------- */
+#if MB_CONFIG_ASYNC_MAX_TOPICS > 0
+typedef struct mb_async_entry {
+    char *topic; /**< 主题串的深拷贝，条目被释放前一直有效 */
+    mb_owned_message_t *slots[MB_CONFIG_ASYNC_QUEUE_DEPTH]; /**< 环形队列本体 */
+    uint32_t head;    /**< 下一个待取出的槽位 */
+    uint32_t count;   /**< 当前积压条数 */
+    /**
+     * 正阻塞在 space 信号量上的发布者数量。
+     * 条目**只有在 count == 0 且 waiters == 0 时**才能被释放：
+     * 否则会连信号量一起销毁，把正等在上面的发布者丢进已释放内存。
+     */
+    uint32_t waiters;
+    mb_sem_t *space; /**< 空位计数信号量，初值 = MB_CONFIG_ASYNC_QUEUE_DEPTH */
+} mb_async_entry_t;
+
+typedef struct mb_async_pool {
+    mb_async_entry_t **entries; /**< 指针数组，与 bus->subs 同样风格，按创建顺序 */
+    size_t entry_count;
+    size_t entry_capacity; /**< = MB_CONFIG_ASYNC_MAX_TOPICS */
+    size_t next_entry;     /**< pump 的轮转游标，保证各主题之间公平 */
+    mb_sem_t *free_entries; /**< 空条目计数信号量，初值 = entry_capacity */
+} mb_async_pool_t;
+#endif
+
+/* -------------------------------------------------------------------------
  * 总线
  * ---------------------------------------------------------------------- */
 struct mb_bus {
@@ -110,6 +147,13 @@ struct mb_bus {
     mb_bus_stats_t stats;
     mb_bus_config_t config;
     bool destroying;
+
+#if MB_CONFIG_ASYNC_MAX_TOPICS > 0
+    /** 异步队列；**首次使用时才分配**，不用异步的总线一个字节都不花。 */
+    mb_async_pool_t async;
+    /** 是否有线程正在 mb_bus_pump()。异步队列只允许被一个线程消费。 */
+    bool pumping;
+#endif
 };
 
 /* -------------------------------------------------------------------------
@@ -162,8 +206,42 @@ mb_err_t mb_dispatch_message(mb_bus_t *bus, const mb_message_t *msg, size_t *out
 void mb_dispatch_retained_to_subscription(mb_bus_t *bus, mb_subscription_t *sub);
 
 /* -------------------------------------------------------------------------
+ * mb_async.c
+ * ---------------------------------------------------------------------- */
+/** 异步发布的公共实现（同步/异步共用发布前的校验与 retained 处理）。 */
+mb_err_t mb_bus_publish_async_internal(mb_bus_t *bus,
+                                       const char *source,
+                                       const char *topic,
+                                       const void *payload,
+                                       size_t payload_len,
+                                       const mb_publish_opts_t *opts,
+                                       uint32_t timeout_ms);
+
+/** 释放异步队列（连同队列里还没投递的消息）。由 mb_bus_destroy 调用。 */
+void mb_async_pool_dispose(mb_bus_t *bus);
+
+/* -------------------------------------------------------------------------
  * mb_bus.c
  * ---------------------------------------------------------------------- */
+
+/**
+ * 发布前的公共校验：qos 检查 → 主题校验 → payload 合法性 → 长度上限，
+ * 并把 opts 归一化成显式值。**不接触总线状态、不加锁**。
+ *
+ * @param out_opts 写入归一化后的选项（opts 为 NULL 时是 flags=0/qos=0）。
+ * @param out_flags 写入这条消息对外可见的 mb_message_t.flags。
+ * @return MB_OK / MB_ERR_UNSUPPORTED / MB_ERR_INVALID_ARG / MB_ERR_TOO_LONG
+ */
+mb_err_t mb_publish_prepare(const char *topic,
+                            const void *payload,
+                            size_t payload_len,
+                            const mb_publish_opts_t *opts,
+                            mb_publish_opts_t *out_opts,
+                            uint8_t *out_flags);
+
+/** 处理 MB_PUB_FLAG_RETAIN：空负载清除保留，否则深拷贝存进 retained 表。锁内调用。 */
+void mb_bus_retain_locked(mb_bus_t *bus, const mb_message_t *msg);
+
 mb_err_t mb_bus_publish_internal(mb_bus_t *bus,
                                  const char *source,
                                  const char *topic,

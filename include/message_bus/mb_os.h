@@ -18,17 +18,19 @@
 #ifndef MESSAGE_BUS_MB_OS_H
 #define MESSAGE_BUS_MB_OS_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "mb_config.h"
+#include "mb_types.h" /* MB_WAIT_FOREVER / MB_WAIT_NONE */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* -------------------------------------------------------------------------
- * 互斥量类型：按 MB_CONFIG_OS 展开成对应平台的真实类型，
+ * 互斥量 / 信号量类型：按 MB_CONFIG_OS 展开成对应平台的真实类型，
  * 布局对用户可见，因此也可以静态分配（见文档）。
  * ---------------------------------------------------------------------- */
 #if MB_CONFIG_OS == MB_OS_WIN32
@@ -42,6 +44,10 @@ typedef union mb_mutex {
     CRITICAL_SECTION win32; /**< 递归锁，Windows 下天然可重入 */
 } mb_mutex_t;
 
+typedef union mb_sem {
+    HANDLE win32; /**< CreateSemaphore() 的句柄 */
+} mb_sem_t;
+
 #elif MB_CONFIG_OS == MB_OS_POSIX
 
 #include <pthread.h>
@@ -49,6 +55,25 @@ typedef union mb_mutex {
 typedef union mb_mutex {
     pthread_mutex_t posix; /**< PTHREAD_MUTEX_RECURSIVE */
 } mb_mutex_t;
+
+/**
+ * POSIX 下用「互斥量 + 条件变量」自己实现计数信号量。
+ *
+ * 刻意不用 sem_t / sem_timedwait：macOS 根本没有 sem_timedwait，
+ * 而 pthread_cond_timedwait 在三大平台都可用。
+ * 代价是默认条件变量基于 CLOCK_REALTIME 计时，实现里必须用同一个时钟
+ * 算截止时刻（见 port/mb_os_posix.c）。
+ */
+typedef struct mb_posix_sem {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    uint32_t count;
+    uint32_t max;
+} mb_posix_sem_t;
+
+typedef union mb_sem {
+    mb_posix_sem_t posix;
+} mb_sem_t;
 
 #elif MB_CONFIG_OS == MB_OS_FREERTOS
 
@@ -75,11 +100,25 @@ typedef union mb_mutex {
     SemaphoreHandle_t freertos; /**< xSemaphoreCreateRecursiveMutex() 的句柄 */
 } mb_mutex_t;
 
+typedef union mb_sem {
+    SemaphoreHandle_t freertos; /**< xSemaphoreCreateCounting() 的句柄 */
+} mb_sem_t;
+
 #elif MB_CONFIG_OS == MB_OS_NONE
 
 typedef union mb_mutex {
     void *ptr; /**< 裸机下不使用，仅用于占位 */
 } mb_mutex_t;
+
+/** 裸机下的计数信号量：只有一个计数，无法阻塞（见下方 mb_os_sem_wait）。 */
+typedef struct mb_none_sem {
+    uint32_t count;
+    uint32_t max;
+} mb_none_sem_t;
+
+typedef union mb_sem {
+    mb_none_sem_t none;
+} mb_sem_t;
 
 #else
 #error "invalid MB_CONFIG_OS: use MB_OS_NONE / MB_OS_FREERTOS / MB_OS_POSIX / MB_OS_WIN32"
@@ -106,6 +145,56 @@ void mb_os_mutex_unlock(mb_mutex_t *mutex);
 
 /** 销毁锁并释放其内存。调用前必须处于未加锁状态。 */
 void mb_os_mutex_destroy(mb_mutex_t *mutex);
+
+/* -------------------------------------------------------------------------
+ * 计数信号量（异步投递的队列满/空靠它阻塞）
+ *
+ * 语义与互斥量相反：加锁是「等锁被释放」，信号量是「等计数变成正数」。
+ * 库只在异步队列里用它，且**永远不会在持有总线锁时做阻塞等待**。
+ * ---------------------------------------------------------------------- */
+
+/**
+ * 创建一个计数信号量。
+ *
+ * @param initial 初始计数，必须 <= max。
+ * @param max     计数上限；为 0 时创建失败。
+ * @return 新信号量；参数非法、内存不足或平台不支持时返回 NULL。
+ */
+mb_sem_t *mb_os_sem_create(uint32_t initial, uint32_t max);
+
+/**
+ * 等待计数变为正数并把它减一。
+ *
+ * @param timeout_ms 最多等多少毫秒：
+ *                   MB_WAIT_NONE（0）= 不等待，拿不到立刻返回 false；
+ *                   MB_WAIT_FOREVER   = 永久等待；
+ *                   其它值            = 最多等这么多毫秒。
+ * @return true  = 已取得一个计数（调用方**必须**最终归还一次）；
+ *         false = 超时，没有取得任何计数。
+ *
+ * @note 裸机（MB_OS_NONE）无法阻塞：计数为 0 时一律立刻返回 false，
+ *       即使 timeout_ms 是 MB_WAIT_FOREVER。详见 docs/porting.md。
+ * @note FreeRTOS 下不能在调度器启动前做**阻塞**等待。
+ */
+bool mb_os_sem_wait(mb_sem_t *sem, uint32_t timeout_ms);
+
+/**
+ * 把计数加一，唤醒一个等待者。
+ *
+ * @return true  = 成功；
+ *         false = 计数已达上限，这次释放被丢弃（调用方多释放了一次）。
+ *
+ * @note 非阻塞，可以在持有总线锁时调用。
+ */
+bool mb_os_sem_signal(mb_sem_t *sem);
+
+/**
+ * 销毁信号量并释放其内存。
+ *
+ * @warning 与 mb_os_mutex_destroy 同理：调用前必须保证**没有任何线程**
+ *          正阻塞在这个信号量上，否则唤醒后会访问已释放的内存。
+ */
+void mb_os_sem_destroy(mb_sem_t *sem);
 
 /* -------------------------------------------------------------------------
  * 时间

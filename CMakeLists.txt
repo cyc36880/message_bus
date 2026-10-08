@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(message_bus
-    VERSION 1.0.0
+    VERSION 1.1.0
     DESCRIPTION "In-process MQTT-style message bus for decoupling LVGL from hardware"
     LANGUAGES C)
 
@@ -60,6 +60,7 @@ message(STATUS "message_bus: OS abstraction layer = ${MB_OS_RESOLVED} (${MB_OS_D
 # 库目标
 # ---------------------------------------------------------------------------
 set(MB_SOURCES
+    src/mb_async.c
     src/mb_bus.c
     src/mb_dispatch.c
     src/mb_log.c

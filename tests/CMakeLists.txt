@@ -4,7 +4,8 @@ add_executable(mb_tests
     test_topic.c
     test_bus.c
     test_pubsub.c
-    test_threads.c)
+    test_threads.c
+    test_async.c)
 
 target_link_libraries(mb_tests PRIVATE message_bus::message_bus mb_warnings)
 

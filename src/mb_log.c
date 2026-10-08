@@ -1,12 +1,13 @@
 /**
  * @file mb_log.c
- * @brief 分级日志实现。
+ * @brief 分级日志实现，以及错误码到短名的映射。
  *
  * 唯一使用 stdio 的地方（vsnprintf 需要）。嵌入式工程可以：
  *   - 把 MB_CONFIG_LOG_LEVEL 设为 0，本文件几乎不产生代码；
  *   - 或调用 mb_log_set_handler() 把输出接管到串口 / RTT。
  */
 #include "message_bus/mb_log.h"
+#include "message_bus/mb_types.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -71,6 +72,24 @@ mb_log_level_t mb_log_get_level(void)
 #else
     return MB_LOG_LEVEL_NONE;
 #endif
+}
+
+const char *mb_err_to_string(mb_err_t err)
+{
+    switch (err) {
+    case MB_OK:                 return "MB_OK";
+    case MB_ERR_INVALID_ARG:    return "MB_ERR_INVALID_ARG";
+    case MB_ERR_NO_MEMORY:      return "MB_ERR_NO_MEMORY";
+    case MB_ERR_NOT_FOUND:      return "MB_ERR_NOT_FOUND";
+    case MB_ERR_ALREADY_EXISTS: return "MB_ERR_ALREADY_EXISTS";
+    case MB_ERR_FULL:           return "MB_ERR_FULL";
+    case MB_ERR_BUSY:           return "MB_ERR_BUSY";
+    case MB_ERR_STATE:          return "MB_ERR_STATE";
+    case MB_ERR_TOO_LONG:       return "MB_ERR_TOO_LONG";
+    case MB_ERR_UNSUPPORTED:    return "MB_ERR_UNSUPPORTED";
+    case MB_ERR_TIMEOUT:        return "MB_ERR_TIMEOUT";
+    default:                    return "MB_ERR_UNKNOWN";
+    }
 }
 
 void mb_log_emit(mb_log_level_t level, const char *tag, const char *fmt, ...)

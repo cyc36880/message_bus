@@ -15,10 +15,14 @@
  *     Arduino-ESP32 位于 freertos/ 子目录，本文件会自动探测）；
  *   - configUSE_RECURSIVE_MUTEXES = 1（总线内部锁需要可重入）；
  *   - configSUPPORT_DYNAMIC_ALLOCATION = 1（本文件用 pvPortMalloc；
- *     若为 0，请复制本文件并把三个内存函数改成静态内存池实现）。
+ *     若为 0，请复制本文件并把三个内存函数改成静态内存池实现）；
+ *   - 使用**异步发布**时还需要 configUSE_COUNTING_SEMAPHORES = 1。
  *
- * 本文件不使用任何阻塞式的队列/任务，因此可以在任意任务（含定时器任务）
- * 中调用总线 API，也可以在启动调度器之前创建总线与节点。
+ * 同步 API 不使用任何阻塞式原语，因此可以在任意任务（含定时器任务）中
+ * 调用，也可以在启动调度器之前创建总线与节点。
+ *
+ * ⚠️ 异步 API 例外：mb_node_publish_async() 在队列满时会阻塞、
+ * mb_bus_pump() 需要被某个任务反复调用，两者都要求**调度器已经在跑**。
  */
 #include "message_bus/mb_config.h"
 
@@ -48,6 +52,13 @@
 
 #if defined(configUSE_RECURSIVE_MUTEXES) && (configUSE_RECURSIVE_MUTEXES != 1)
 #error "message_bus requires FreeRTOS configUSE_RECURSIVE_MUTEXES = 1"
+#endif
+
+/* 异步投递的队列满/空靠计数信号量阻塞；关掉异步就不需要这一项 */
+#if MB_CONFIG_ASYNC_MAX_TOPICS > 0
+#if defined(configUSE_COUNTING_SEMAPHORES) && (configUSE_COUNTING_SEMAPHORES != 1)
+#error "message_bus async publishing requires FreeRTOS configUSE_COUNTING_SEMAPHORES = 1"
+#endif
 #endif
 
 #if defined(configSUPPORT_DYNAMIC_ALLOCATION) && (configSUPPORT_DYNAMIC_ALLOCATION == 0)
@@ -96,6 +107,67 @@ void mb_os_mutex_destroy(mb_mutex_t *mutex)
         vSemaphoreDelete(mutex->freertos);
     }
     vPortFree(mutex);
+}
+
+mb_sem_t *mb_os_sem_create(uint32_t initial, uint32_t max)
+{
+    mb_sem_t *sem;
+
+    if (max == 0 || initial > max) {
+        return NULL;
+    }
+
+    sem = (mb_sem_t *)pvPortMalloc(sizeof(*sem));
+    if (sem == NULL) {
+        return NULL;
+    }
+    /* 注意 UBaseType_t 在部分移植上是 8 位，max 超过 255 会被静默截断 */
+    sem->freertos = xSemaphoreCreateCounting((UBaseType_t)max, (UBaseType_t)initial);
+    if (sem->freertos == NULL) {
+        vPortFree(sem);
+        return NULL;
+    }
+    return sem;
+}
+
+bool mb_os_sem_wait(mb_sem_t *sem, uint32_t timeout_ms)
+{
+    TickType_t ticks;
+
+    /* 必须先判永久等待：0xFFFFFFFF 毫秒经过 pdMS_TO_TICKS 会溢出成一个
+     * 有限的、不可预期的 tick 数。 */
+    if (timeout_ms == MB_WAIT_FOREVER) {
+        ticks = portMAX_DELAY;
+    } else {
+        /* pdMS_TO_TICKS 是向下取整：1ms 在 100Hz 的 tick 下会变成 0 tick，
+         * 也就是「不等」，与「最多等 1ms」的承诺不符。这里向上取整。
+         *
+         * 不用 (a + b - 1) / b 那个常见写法：timeout_ms 接近 0xFFFFFFFF 时
+         * 加法会溢出，一个大超时会被算成接近 0 —— 变成「立刻超时」，
+         * 而且是静默的。先除后补余数不会溢出。 */
+        uint32_t period = (uint32_t)portTICK_PERIOD_MS;
+        uint32_t whole = timeout_ms / period;
+
+        ticks = (TickType_t)(whole + (((timeout_ms % period) != 0u) ? 1u : 0u));
+    }
+
+    return xSemaphoreTake(sem->freertos, ticks) == pdTRUE;
+}
+
+bool mb_os_sem_signal(mb_sem_t *sem)
+{
+    return xSemaphoreGive(sem->freertos) == pdTRUE;
+}
+
+void mb_os_sem_destroy(mb_sem_t *sem)
+{
+    if (sem == NULL) {
+        return;
+    }
+    if (sem->freertos != NULL) {
+        vSemaphoreDelete(sem->freertos);
+    }
+    vPortFree(sem);
 }
 
 uint32_t mb_os_time_ms(void)

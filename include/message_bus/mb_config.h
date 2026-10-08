@@ -74,6 +74,47 @@
 #endif
 
 /* -------------------------------------------------------------------------
+ * 异步投递（队列 + pump 线程）
+ *
+ * 异步队列是**两级**结构：
+ *   - 总线里最多容纳 MB_CONFIG_ASYNC_MAX_TOPICS 个**主题条目**
+ *     （"a/b"、"a/c" 各占一个条目）；
+ *   - 每个条目内是一条深度为 MB_CONFIG_ASYNC_QUEUE_DEPTH 的 FIFO
+ *     （往 "a/b" 连发内容 1、2，该条目里就积压两条）。
+ *
+ * 把 MB_CONFIG_ASYNC_MAX_TOPICS 设为 0 即可在编译期完全去掉异步功能，
+ * 此时 mb_node_publish_async() / mb_bus_pump() 一律返回 MB_ERR_UNSUPPORTED，
+ * 且不产生任何代码与 RAM 开销。
+ * ---------------------------------------------------------------------- */
+
+/** 异步队列能容纳的主题条目数；0 = 编译期关闭异步功能。 */
+#ifndef MB_CONFIG_ASYNC_MAX_TOPICS
+#define MB_CONFIG_ASYNC_MAX_TOPICS 16
+#endif
+
+/** 每个主题条目内允许积压的消息条数。 */
+#ifndef MB_CONFIG_ASYNC_QUEUE_DEPTH
+#define MB_CONFIG_ASYNC_QUEUE_DEPTH 4
+#endif
+
+/**
+ * 主题条目满时的**默认**策略：
+ *   0 = 阻塞等待（最多等发布时传入的 timeout_ms，超时返回 MB_ERR_TIMEOUT）
+ *   1 = 丢弃该条目里最旧的一条，给新消息腾位置（永不阻塞）
+ *
+ * 单次发布可以用 MB_PUB_FLAG_ASYNC_OVERWRITE 覆盖这里的默认值。
+ * 「状态」类主题（传感器当前值）建议用覆盖：消费端慢时只保留最新值；
+ * 「命令/事件」类主题必须用等待或报错，丢弃会丢动作。
+ */
+#ifndef MB_CONFIG_ASYNC_OVERWRITE_OLDEST
+#define MB_CONFIG_ASYNC_OVERWRITE_OLDEST 0
+#endif
+
+#if MB_CONFIG_ASYNC_MAX_TOPICS > 0 && MB_CONFIG_ASYNC_QUEUE_DEPTH < 1
+#error "MB_CONFIG_ASYNC_QUEUE_DEPTH must be >= 1 when async is enabled"
+#endif
+
+/* -------------------------------------------------------------------------
  * 运行期行为
  * ---------------------------------------------------------------------- */
 
