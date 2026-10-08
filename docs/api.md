@@ -42,6 +42,8 @@ typedef enum mb_err {
     MB_ERR_TOO_LONG     = -8,  /* 超过配置的长度上限 */
     MB_ERR_UNSUPPORTED  = -9,  /* 当前平台/配置不支持（如 qos != 0） */
     MB_ERR_TIMEOUT      = -10, /* 异步发布时队列满，等到超时仍没有空位 */
+    MB_ERR_WOULD_DEADLOCK = -11,/* 这次调用会永久卡死，已被拒绝（pump 回调里做
+                                 * MB_WAIT_FOREVER 的异步发布） */
 } mb_err_t;
 
 const char *mb_err_to_string(mb_err_t err);   /* → "MB_ERR_NOT_FOUND" */
@@ -485,6 +487,7 @@ mb_err_t mb_bus_publish_async(mb_bus_t *bus, const char *topic,
 | `MB_ERR_INVALID_ARG` / `MB_ERR_TOO_LONG` / `MB_ERR_UNSUPPORTED` | 与同步版本完全相同 |
 | `MB_ERR_NO_MEMORY` | 深拷贝失败 |
 | `MB_ERR_STATE` | 总线正在销毁 |
+| `MB_ERR_WOULD_DEADLOCK` | 在 [`mb_bus_pump()`](#队列处理) 的回调里调用，且 `timeout_ms` 是 `MB_WAIT_FOREVER`。**没有任何副作用**：没入队，也不算丢弃 |
 
 ```c
 /* 传感器任务：入队即返回，不再被刷屏拖慢 */
@@ -508,6 +511,17 @@ mb_node_publish_async(sensor, "sensor/temp/value", buf, len, &opts, MB_WAIT_NONE
 > 覆盖只影响「**同一主题内**积压太多」，与主题条目总数无关：
 > `MB_CONFIG_ASYNC_MAX_TOPICS` 个条目名额用尽时，新主题仍然只能等（或超时）——
 > 否则会把别的主题挤掉，那就不叫「按主题分组」了。
+
+> ⚠️ **从 `mb_bus_pump()` 的回调里做 `MB_WAIT_FOREVER` 的异步发布会被拒绝**，
+> 返回 `MB_ERR_WOULD_DEADLOCK`。回调跑在 pump 线程上，而腾空位的正是 pump ——
+> 它此刻卡在你的回调里，等不到自己，硬等就是**永久死锁**。库会比对线程标识
+> 识别出这种情况并直接拒绝，而不是让程序挂死。
+>
+> 传具体毫秒数**不受影响**：回调里往「另一个还有空位的主题」发布根本不会阻塞，
+> 那种写法应该正常成功；真要阻塞就照常超时（`MB_ERR_TIMEOUT` + `async_dropped`）。
+>
+> 回调里要发布就传 `MB_WAIT_NONE`，或用 `MB_PUB_FLAG_ASYNC_OVERWRITE`
+> 走覆盖策略，**并且同样传 `MB_WAIT_NONE`**（覆盖 + 不等待时永不阻塞）。
 
 ### 队列处理
 
@@ -580,11 +594,17 @@ printf("积压 %zu 条，占用 %zu 个主题\n",
 线程变成正在解引用的线程）。所以销毁前必须先把所有线程 join 掉：
 
 ```c
-/* ✅ 正确的关闭顺序 */
+/* ✅ 正确的关闭顺序（生产者不会永久阻塞时） */
 g_pump_should_stop = true;
 thread_join(&pump_thread);
 mb_bus_destroy(bus);
 ```
+
+> ⚠️ **生产者用了 `MB_WAIT_FOREVER` 时不能先停 pump。** 阻塞在满队列上的生产者
+> 等的是「pump 腾出空位」，先停 pump 就再没人叫醒它，`thread_join()` 会永久挂住。
+> 那种情况下顺序要反过来：先停生产者 → 循环 pump 直到 `mb_bus_async_pending()`
+> 归零 → 最后停 pump。完整的代码见
+> [architecture.md § 8.3](architecture.md#83-不要在回调里销毁总线)。
 
 ---
 

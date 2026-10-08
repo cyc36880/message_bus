@@ -577,7 +577,19 @@ mb_node_t *mb_subscription_node(const mb_subscription_t *sub)
 
 void *mb_subscription_user_data(const mb_subscription_t *sub)
 {
-    return (sub != NULL) ? sub->user_data : NULL;
+    void *user_data;
+
+    if (sub == NULL) {
+        return NULL;
+    }
+
+    /* user_data 是本结构里**唯一可变**的字段（见下面的 setter），
+     * 所以读它必须和写它取同一把锁。上面三个 getter 读的是建好就不再改的
+     * 字段，不加锁是安全的；这个不加锁就是一个纯粹的数据竞争。 */
+    MB_BUS_LOCK(sub->bus);
+    user_data = sub->user_data;
+    MB_BUS_UNLOCK(sub->bus);
+    return user_data;
 }
 
 void *mb_subscription_set_user_data(mb_subscription_t *sub, void *user_data)

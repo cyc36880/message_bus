@@ -163,6 +163,14 @@ void mb_os_sleep_ms(uint32_t ms)
     MB_CONFIG_SLEEP_MS(ms);
 }
 
+mb_thread_id_t mb_os_thread_id(void)
+{
+    /* 裸机没有线程概念，只有一个执行流，固定返回 0 即可。
+     * 配合 MB_OS_CAN_BLOCK == 0，库在裸机上不做 pump 线程检查
+     * （这里信号量本来就不会阻塞，谈不上「等自己」）。 */
+    return (mb_thread_id_t)0;
+}
+
 void *mb_os_malloc(size_t size)
 {
     return MB_CONFIG_MALLOC(size);

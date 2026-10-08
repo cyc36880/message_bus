@@ -41,6 +41,7 @@ typedef enum mb_err {
     MB_ERR_TOO_LONG = -8,      /**< 字符串或数据超过配置上限 */
     MB_ERR_UNSUPPORTED = -9,   /**< 当前平台/配置不支持该功能 */
     MB_ERR_TIMEOUT = -10,      /**< 等待超时（异步发布的队列满且等不到空位） */
+    MB_ERR_WOULD_DEADLOCK = -11, /**< 这次调用会永久卡死，已被拒绝；见 mb_node_publish_async */
 } mb_err_t;
 
 /** @return 错误码对应的英文短名，如 "MB_ERR_NOT_FOUND"。 */

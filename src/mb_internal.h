@@ -153,6 +153,11 @@ struct mb_bus {
     mb_async_pool_t async;
     /** 是否有线程正在 mb_bus_pump()。异步队列只允许被一个线程消费。 */
     bool pumping;
+    /**
+     * 正在 mb_bus_pump() 的那个线程（只在 pumping 为 true 时有意义）。
+     * 用来拦下「从 pump 回调里做会阻塞的异步发布」——那必然死锁。见 mb_os.h。
+     */
+    mb_thread_id_t pump_owner;
 #endif
 };
 

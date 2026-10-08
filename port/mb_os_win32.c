@@ -105,6 +105,13 @@ void mb_os_sleep_ms(uint32_t ms)
     Sleep((DWORD)ms);
 }
 
+mb_thread_id_t mb_os_thread_id(void)
+{
+    /* GetCurrentThreadId() 返回的 DWORD 在线程存活期间唯一，正是要的语义。
+     * 库只做相等比较，所以不必关心它是否等于线程句柄。 */
+    return (mb_thread_id_t)GetCurrentThreadId();
+}
+
 void *mb_os_malloc(size_t size)
 {
     return malloc(size);

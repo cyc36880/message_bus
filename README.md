@@ -170,7 +170,7 @@ target_link_libraries(your_app PRIVATE message_bus::message_bus)
 | Linux / macOS | `MB_OS_POSIX` | ✅ 已实现 |
 | **FreeRTOS（MCU）** | `MB_OS_FREERTOS` | ✅ 已实现，需 `configUSE_RECURSIVE_MUTEXES = 1`；用异步投递还需 `configUSE_COUNTING_SEMAPHORES = 1` |
 | 裸机 / 无 RTOS | `MB_OS_NONE` | ✅ 已实现（临界区宏可覆盖）。**异步投递无法真正阻塞**，见 porting.md § 2.1 |
-| 其它 RTOS | — | 新增一个 `port/mb_os_xxx.c`，只需实现 7 个函数（有异步时 11 个） |
+| 其它 RTOS | — | 新增一个 `port/mb_os_xxx.c`，只需实现 10 个函数（有异步时 14 个） |
 
 CMake 下 `-DMB_OS=auto`（默认）会按平台自动选择。
 
@@ -278,7 +278,7 @@ message_bus/
 │   ├── mb_async.c         #   ★ 异步队列 + pump（可选）
 │   ├── mb_bus.c  mb_node.c  mb_subscription.c
 │   ├── mb_topic.c  mb_message.c  mb_log.c
-├── port/                  # 平台层：每个平台一个文件，7 个函数（+4 个有异步时）
+├── port/                  # 平台层：每个平台一个文件，10 个函数（+4 个有异步时）
 │   ├── mb_os_win32.c  mb_os_posix.c
 │   ├── mb_os_freertos.c   #   ★ MCU 目标平台
 │   └── mb_os_none.c       #   裸机
@@ -309,7 +309,7 @@ message_bus unit tests
   async (async delivery)
   threads (thread safety)
 
-612 assertions, 0 failed
+650 assertions, 0 failed
 ALL PASSED
 ```
 
@@ -317,10 +317,15 @@ ALL PASSED
 订阅/退订，用来验证引用计数确实经得起「回调执行中对象被另一个线程销毁」。
 
 `async` 套件覆盖两级队列的独立性与 FIFO、非阻塞 pump、满队列的等待/超时/覆盖
-三条路径、深拷贝、retained 语义，以及「4 个生产者线程 + 1 个 pump 线程」
-的背压（生产者用 `MB_WAIT_FOREVER`，一条都不许丢）。
+三条路径、深拷贝、retained 语义，「4 个生产者线程 + 1 个 pump 线程」的背压
+（生产者用 `MB_WAIT_FOREVER`，一条都不许丢），以及回调里发布的三种超时：
+`MB_WAIT_FOREVER` 被拒（`MB_ERR_WOULD_DEADLOCK`，否则必然死锁），
+`MB_WAIT_NONE` 与具体毫秒数照常成功。
 
-CI 还会在 Linux 上跑一遍 ASan + UBSan。
+CI 在 Linux 上除了跑一遍 **ASan + UBSan**，还会跑一遍 **ThreadSanitizer** ——
+前者抓内存错误，后者抓数据竞争，两者不能共存于同一个二进制，所以各是一个 job。
+另外有一个**配置矩阵** job，把默认开启、关闭异步功能、队列深度 1
+三种编译期配置各跑一遍完整测试。
 
 ---
 

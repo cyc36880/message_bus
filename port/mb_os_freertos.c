@@ -182,6 +182,14 @@ void mb_os_sleep_ms(uint32_t ms)
     vTaskDelay(pdMS_TO_TICKS(ms));
 }
 
+mb_thread_id_t mb_os_thread_id(void)
+{
+    /* TaskHandle_t 就是 TCB 指针，同一任务恒定、不同任务互异，正是要的语义。
+     * 调度器启动前它可能返回 NULL —— 库只做相等比较，NULL 与 NULL 相等
+     * 也不会误判（此时不可能有线程在 pump）。 */
+    return (mb_thread_id_t)xTaskGetCurrentTaskHandle();
+}
+
 void *mb_os_malloc(size_t size)
 {
     return pvPortMalloc(size);

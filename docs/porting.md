@@ -418,7 +418,7 @@ ctest --test-dir build --output-on-failure
 
 ## 4. 新增一个 port（其它 RTOS）
 
-以 RT-Thread 为例。**只需实现 7 个函数**（不用异步投递的话；用到异步还要再加 4 个
+以 RT-Thread 为例。**只需实现 10 个函数**（不用异步投递的话；用到异步还要再加 4 个
 信号量函数，见本节末尾）：
 
 ```c
@@ -459,6 +459,10 @@ void mb_os_mutex_destroy(mb_mutex_t *mutex)
 
 uint32_t mb_os_time_ms(void)                { return (uint32_t)rt_tick_get_millisecond(); }
 void     mb_os_sleep_ms(uint32_t ms)        { rt_thread_mdelay((rt_int32_t)ms); }
+
+/* 只需「同一线程恒定、不同线程互异」，用来识别 pump 线程（见 4.2）。
+ * 拿不到线程句柄时，返回线程名字符串的哈希之类也行。 */
+mb_thread_id_t mb_os_thread_id(void)        { return (mb_thread_id_t)rt_thread_self(); }
 
 void *mb_os_malloc(size_t size)             { return rt_malloc(size); }
 void *mb_os_calloc(size_t count, size_t size)
@@ -545,9 +549,33 @@ void mb_os_sem_destroy(mb_sem_t *sem)
 `mb_os_sem_wait()` 返回 `false` 表示**超时**（不是错误）；调用方据此返回
 `MB_ERR_TIMEOUT`。`MB_WAIT_NONE`（0）表示不等待，必须立即返回当前是否拿得到。
 
+### 4.2 `mb_os_thread_id()`：识别 pump 线程
+
+用来拦住「从 `mb_bus_pump()` 的回调里做会无限等待的异步发布」这种必然死锁的
+调用（回调跑在 pump 线程上，而腾出空位的正是 pump 自己，见
+[architecture.md 第 4 节](architecture.md#回调里发布要走覆盖策略不能阻塞)）。
+库只拿它做**相等比较**，所以任何「同一线程恒定、不同线程互异」的整数都行：
+
+| 平台 | 实现 |
+|---|---|
+| Win32 | `(mb_thread_id_t)GetCurrentThreadId()` |
+| POSIX | `(mb_thread_id_t)pthread_self()`（不透明句柄直接强转成整数） |
+| FreeRTOS | `(mb_thread_id_t)xTaskGetCurrentTaskHandle()`（即 TCB 指针） |
+| 裸机 | `0` —— 只有一个执行流 |
+
+> ⚠️ **这是给已有第三方 port 的一处不兼容改动**：升级后如果 port 里没有
+> `mb_os_thread_id()`，用到异步投递时会在**链接期**报
+> `undefined reference to 'mb_os_thread_id'`。补上上面那一行即可。
+> 不用异步投递（编译期关掉 `MB_CONFIG_ASYNC_MAX_TOPICS`）的工程不受影响 ——
+> 那时库根本不引用这个符号。
+
+能阻塞的 port 保持 `MB_OS_CAN_BLOCK` 为默认的 1；`MB_OS_NONE` 在 `mb_os.h`
+里已定义成 0，那会把整个检查编译掉（裸机信号量本来就不阻塞，没有「等自己」可言）。
+
 ### 移植检查清单
 
 - [ ] 锁是**递归**的（同一个执行流重复加锁必须成功）
+- [ ] `mb_os_thread_id()` 同线程恒定、跨线程互异（用到异步投递时必需）
 - [ ] `mb_os_time_ms()` 单调递增，且**无符号回绕语义**正确（`t2 - t1` 在回绕后仍正确）
 - [ ] `mb_os_calloc()` 做了乘法溢出检查
 - [ ] **没有实现/使用 `realloc`** —— 库刻意不用它，很多 RTOS 堆没有

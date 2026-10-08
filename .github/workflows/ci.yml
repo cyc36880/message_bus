@@ -130,6 +130,89 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
   # ---------------------------------------------------------------------------
+  # ThreadSanitizer：抓数据竞争（data race）
+  #
+  # 为什么必须单独一个 job：ASan/UBSan **不检测数据竞争** —— 上面的
+  # sanitizers job 能抓到异步队列的越界写、释放后使用、内存泄漏，但对
+  # 「两个线程同时读写同一个字段」完全无感。检测竞争的只有 TSan，
+  # 而 TSan 与 ASan 不能同时启用在同一个二进制里，所以只能各跑一遍。
+  #
+  # 覆盖面：整个 mb_tests（test_main.c 的 main(void) 不接受参数，无法只选
+  # 套件）。真正有意义的是 threads 与 async 两个套件 —— 生产者线程、
+  # 计数信号量、以及覆盖策略下的消息回收路径都在那里。
+  #
+  # 注意 TSan 只支持 x86_64 Linux/macOS，MinGW 目标直接拒绝
+  # （clang 会报 unsupported option '-fsanitize=thread'），所以这里只跑 Linux。
+  # ---------------------------------------------------------------------------
+  tsan:
+    name: Linux (ThreadSanitizer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装构建工具
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: 配置
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DMB_BUILD_EXAMPLES=OFF \
+            -DMB_WARNINGS_AS_ERRORS=ON \
+            -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+
+      - name: 编译
+        run: cmake --build build --parallel
+
+      - name: 单元测试
+        env:
+          # second_deadlock_stack=1：报告死锁时把涉及的**两方**调用栈都打出来，
+          # 否则只能看到阻塞住的那一个线程，定位要靠猜。
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  # 配置矩阵：库支持若干编译期配置，只验默认那一种等于没验 ——
+  # 同一份代码在不同宏下走的是不同的分支，测试里也有对应的 #if 守卫。
+  #
+  # 注意 CMAKE_C_FLAGS 是给**所有目标**的：库与测试必须看到同一组宏，
+  # 否则测试里的 #if 守卫和库的真实行为会对不上，测出来的结论是假的。
+  # ---------------------------------------------------------------------------
+  configs:
+    name: 配置矩阵（${{ matrix.name }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: 覆盖最旧消息（编译期默认开启）
+            defs: -DMB_CONFIG_ASYNC_OVERWRITE_OLDEST=1
+          - name: 关闭异步功能
+            defs: -DMB_CONFIG_ASYNC_MAX_TOPICS=0
+          - name: 队列深度 1（最紧的边界）
+            defs: -DMB_CONFIG_ASYNC_QUEUE_DEPTH=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装构建工具
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: 配置
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DMB_BUILD_EXAMPLES=OFF \
+            -DMB_WARNINGS_AS_ERRORS=ON \
+            -DCMAKE_C_FLAGS="${{ matrix.defs }}"
+
+      - name: 编译
+        run: cmake --build build --parallel
+
+      - name: 单元测试
+        run: ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------------------
   # 交叉编译冒烟测试：确认 freertos / none 两个 port 至少能编译
   # ---------------------------------------------------------------------------
   ports:
@@ -141,70 +224,18 @@ jobs:
       - name: 安装构建工具
         run: sudo apt-get update && sudo apt-get install -y ninja-build
 
-      # 用 stub 头文件模拟 FreeRTOS，只验证 port 源码本身语法正确
-      - name: 生成 FreeRTOS 头文件桩
-        run: |
-          mkdir -p /tmp/freertos-stub
-          cat > /tmp/freertos-stub/projdefs.h <<'EOF'
-          #ifndef PROJDEFS_H
-          #define PROJDEFS_H
-          #define pdTRUE  1
-          #define pdFALSE 0
-          typedef int BaseType_t;
-          #endif
-          EOF
-          cat > /tmp/freertos-stub/portmacro.h <<'EOF'
-          #ifndef PORTMACRO_H
-          #define PORTMACRO_H
-          #include <stdint.h>
-          #define portTICK_PERIOD_MS 1u
-          #define portMAX_DELAY      ((TickType_t)0xFFFFFFFFu)
-          #define pdMS_TO_TICKS(ms)  ((TickType_t)(ms))
-          typedef uint32_t TickType_t;
-          #endif
-          EOF
-          cat > /tmp/freertos-stub/FreeRTOS.h <<'EOF'
-          #ifndef FREERTOS_H
-          #define FREERTOS_H
-          #include <stddef.h>
-          #include "projdefs.h"
-          #include "portmacro.h"
-          #define configUSE_RECURSIVE_MUTEXES      1
-          #define configSUPPORT_DYNAMIC_ALLOCATION 1
-          #define configTICK_RATE_HZ               1000
-          typedef void *TaskHandle_t;
-          void *pvPortMalloc(size_t size);
-          void  vPortFree(void *p);
-          #endif
-          EOF
-          # 真实 FreeRTOS 把 vTaskDelay / xTaskGetTickCount 声明在 task.h，
-          # port 源码也按这个布局 #include "task.h"，桩必须提供该头文件。
-          cat > /tmp/freertos-stub/task.h <<'EOF'
-          #ifndef TASK_H
-          #define TASK_H
-          #include "FreeRTOS.h"
-          void       vTaskDelay(TickType_t ticks);
-          TickType_t xTaskGetTickCount(void);
-          #endif
-          EOF
-          cat > /tmp/freertos-stub/semphr.h <<'EOF'
-          #ifndef SEMPHR_H
-          #define SEMPHR_H
-          #include "FreeRTOS.h"
-          typedef void *SemaphoreHandle_t;
-          SemaphoreHandle_t xSemaphoreCreateRecursiveMutex(void);
-          BaseType_t xSemaphoreTakeRecursive(SemaphoreHandle_t s, TickType_t timeout);
-          BaseType_t xSemaphoreGiveRecursive(SemaphoreHandle_t s);
-          void vSemaphoreDelete(SemaphoreHandle_t s);
-          #endif
-          EOF
-          ls /tmp/freertos-stub
+      # FreeRTOS 头文件桩在仓库里（tests/freertos_stub/），不再由本文件现写。
+      # 以前是内联 heredoc，后果是改 port 加了新的 FreeRTOS API 而桩没跟上时，
+      # 只有 CI 会挂、本地看不出来 —— 异步投递的计数信号量就是这么漏的。
+      # 现在它和 port 一起进版本控制，缺失会出现在同一个 diff 里。
+      - name: 检查 FreeRTOS 头文件桩
+        run: ls tests/freertos_stub
 
       - name: 配置（FreeRTOS port）
         run: |
           cmake -S . -B build-freertos -G Ninja \
             -DMB_OS=freertos \
-            -DMB_FREERTOS_INCLUDE_DIR=/tmp/freertos-stub \
+            -DMB_FREERTOS_INCLUDE_DIR="$GITHUB_WORKSPACE/tests/freertos_stub" \
             -DMB_BUILD_TESTS=OFF -DMB_BUILD_EXAMPLES=OFF \
             -DMB_WARNINGS_AS_ERRORS=ON
 

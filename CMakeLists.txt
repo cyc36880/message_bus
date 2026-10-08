@@ -88,7 +88,20 @@ target_include_directories(message_bus
 target_compile_definitions(message_bus PUBLIC MB_CONFIG_OS=${MB_OS_DEFINE})
 
 if(MB_FREERTOS_INCLUDE_DIR)
-    target_include_directories(message_bus PUBLIC ${MB_FREERTOS_INCLUDE_DIR})
+    # 必须包在 $<BUILD_INTERFACE:> 里，有两个原因：
+    #
+    #   1. 不包的话这个路径会进入 INSTALL_INTERFACE，被写进导出的
+    #      message_bus-targets.cmake。而它往往是构建机上的一条绝对路径
+    #      （/opt/FreeRTOS/include 之类），在消费方机器上未必存在 ——
+    #      等于把一个假的 include 目录推给所有 find_package 的用户。
+    #      FreeRTOS 头文件本来就该由消费方自己的工具链提供，
+    #      不该由本库转手。
+    #   2. CMake 拒绝把**源码树内**的路径放进 INTERFACE_INCLUDE_DIRECTORIES
+    #      （报 "which is prefixed in the source directory"）。加了
+    #      BUILD_INTERFACE 之后，tests/freertos_stub 这种仓库内的桩目录
+    #      就能直接用，CI 与本地跑的才是同一份头文件。
+    target_include_directories(message_bus PUBLIC
+        $<BUILD_INTERFACE:${MB_FREERTOS_INCLUDE_DIR}>)
 endif()
 
 if(MB_OS_RESOLVED STREQUAL "posix")

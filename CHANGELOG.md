@@ -48,10 +48,32 @@
 
 - **新统计字段**：`async_enqueued`、`async_dropped`、`async_overwritten`。
 
-- **`tests/test_async.c`**：17 个用例 / 225 条断言，覆盖两级队列的独立性与 FIFO、
+- **回调里做无限等待的异步发布现在会被拒绝**，而不是把程序挂死。
+  回调跑在 pump 线程上，而腾出队列空位的正是 pump 自己 —— 它此刻正卡在你的
+  回调里，传 `MB_WAIT_FOREVER` 就是在等一个永远不会到来的条件，会**永久死锁**、
+  连超时都报不出来。现在 `mb_os.h` 新增 `mb_os_thread_id()`，总线记下
+  `pump_owner`，发布前比对一次，直接返回新错误码 **`MB_ERR_WOULD_DEADLOCK`**
+  并记一条 WARN。被拒的调用**没有任何副作用**：没入队，也不算「丢弃」。
+
+  只拦 `MB_WAIT_FOREVER`。传具体毫秒数**不受影响**：回调里往「另一个还有空位的
+  主题」发布根本不会阻塞，那种正常写法不应该被挡掉；真要阻塞就照常返回
+  `MB_ERR_TIMEOUT` 并计入 `async_dropped`。裸机（`MB_OS_NONE`）不做这项检查 ——
+  那里信号量本来就不阻塞，没有「等自己」可言（用 `MB_OS_CAN_BLOCK` 编译掉）。
+
+- **`tests/test_async.c`**：19 个用例，覆盖两级队列的独立性与 FIFO、
   非阻塞 pump、满队列的等待/超时/覆盖三条路径、深拷贝、retained 语义、
-  回调线程归属，以及「4 个生产者线程 + 1 个 pump 线程」的背压
-  （生产者 `MB_WAIT_FOREVER`，一条都不许丢）。
+  回调线程归属，「4 个生产者线程 + 1 个 pump 线程」的背压
+  （生产者 `MB_WAIT_FOREVER`，一条都不许丢），以及
+  「普通生产者与覆盖生产者混在同一主题上」的账目不变式
+  （队列排空后断言 `async_enqueued == 投递数 + async_overwritten`），
+  后者是那个记账竞态的回归测试。
+
+  回调里发布的三种超时也分别钉住：`MB_WAIT_FOREVER` 被拒且不留痕迹，
+  `MB_WAIT_NONE` 与具体毫秒数照常成功；同时断言「pump 结束后在别的线程上
+  用 `MB_WAIT_FOREVER` 仍然合法」，防止这项新检查变成误伤。
+
+  用例对队列深度不敏感：深度 1 也是受支持的配置，深度相关的地方按
+  `MB_CONFIG_ASYNC_QUEUE_DEPTH` 取分支，而不是写死「能积压两条」。
 
 ### 修复
 
@@ -62,6 +84,49 @@
 - **修正 `mb_async.c` 覆盖策略的空位记账错误**（本版本新增的代码，在测试中发现）：
   覆盖最旧消息时只推进了队头却没有递减 `count`，导致该主题队列的
   `count` 比实际多 1，第二次覆盖就会越界写入。已在 `entry->count--` 处修正。
+- **修正 `mb_async.c` 空位令牌与队列计数之间的记账竞态**。这是上面那条的
+  同族问题，但机制不同，而且是**混合模式**下才会暴露：普通（阻塞）生产者
+  在**锁外**领走空位令牌、到**锁内**才提交 `count++`，两步之间留下一个
+  「已预定未提交」的窗口，此时 `space.count == ASYNC_DEPTH - count - 1`。
+  覆盖路径原先假设「`count < ASYNC_DEPTH` ⇒ 一定拿得到令牌」并在拿不到时
+  `MB_CONFIG_ASSERT`，于是在这个窗口里：调试构建**直接断言中止**，
+  量产构建则让空位账永久漂移 —— 之后要么无故超时丢消息，要么环形队列写越界。
+
+  触发条件是同一个主题上**混用**两种模式（全用普通模式走不到那段代码，
+  全用覆盖模式则不存在在途预定）。深 4 时窗口很窄不易撞上，
+  `MB_CONFIG_ASYNC_QUEUE_DEPTH=1` 时极易复现 —— 正因如此新增了队列深度 1 的
+  CI 配置。现在覆盖路径改为循环：拿不到令牌且队列未满时放锁等一个令牌，
+  回到循环开头重新判断（届时队列已满，走覆盖分支）。
+- **修正 POSIX 信号量把超时算成相对时间的问题**（`port/mb_os_posix.c`）。
+  截止时刻原本在 `while` 循环**内部**计算，每被虚假唤醒一次就重算成
+  「现在 + `timeout_ms`」，于是「最多等 `timeout_ms`」被悄悄变成
+  「连续睡满 `timeout_ms`」，实际等待可以远超调用方给的上限。
+  现在截止时刻在进循环前只算一次。Windows 的 `WaitForSingleObject` 与
+  FreeRTOS 的 `xSemaphoreTake` 都是单次调用，没有这个问题。
+- **`mb_subscription_user_data()` 改为加锁读取**（`src/mb_node.c`）。
+  `user_data` 是订阅结构里唯一可变的字段（有对应的
+  `mb_subscription_set_user_data()`），而 getter 此前不加锁 ——
+  一个线程读、另一个线程写就是纯粹的数据竞争。同文件其它 getter
+  读的是建好后不再变的字段，不加锁是安全的。
+
+### 构建与 CI
+
+- **FreeRTOS 头文件桩改为进仓库**（`tests/freertos_stub/`）。它原先直接写在
+  `.github/workflows/ci.yml` 的 heredoc 里，于是改 port 加了新的 FreeRTOS API
+  而桩没跟上时只有 CI 会挂、本地看不出来 —— 异步投递的计数信号量就是这么漏的
+  （CI 报 `implicit-function-declaration: xSemaphoreCreateCounting`）。
+  现在桩和 port 一起进版本控制，缺失会出现在同一个 diff 里。
+- **`MB_FREERTOS_INCLUDE_DIR` 改用 `$<BUILD_INTERFACE:>` 包装**
+  （`CMakeLists.txt`）。原来它是个 `PUBLIC` 的绝对路径，会被写进导出的
+  `message_bus-targets.cmake` 推给所有 `find_package` 的用户 ——
+  而那是构建机上的路径，在别人机器上未必存在。顺带这也让仓库内的桩目录
+  能直接用（CMake 拒绝把源码树内的路径放进 `INTERFACE_INCLUDE_DIRECTORIES`）。
+- **新增 ThreadSanitizer job**。ASan/UBSan **不检测数据竞争**，而检测竞争只有
+  TSan 一个选择，且 TSan 与 ASan 不能共存于同一个二进制，所以必须各跑一遍。
+- **新增配置矩阵 job**：覆盖默认开启、**关闭异步功能**、**队列深度 1**
+  三种编译期配置各跑一遍完整测试。深度 1 是最紧的边界，
+  上面那个记账竞态就是它逼出来的。`MB_CONFIG_ASYNC_QUEUE_DEPTH` 只要求 ≥ 1，
+  所以深度 1 是受支持的配置，值得有 CI 兜着。
 
 ### 兼容性
 
@@ -77,10 +142,16 @@
   `#if MB_CONFIG_ASYNC_MAX_TOPICS > 0` 之内，所以把该宏设为 0 时
   `mb_async.c` 整个编译为空，不会产生对这四个符号的引用
   （已用 `nm` 验证目标文件里没有相关的未定义符号）。
+- ⚠️ **自建 port 还要再补一个 `mb_os_thread_id()`**（用到异步投递时）。
+  这是一处**不兼容改动**：旧 port 升级后会在**链接期**报
+  `undefined reference to 'mb_os_thread_id'`。补一行即可 ——
+  Win32 是 `GetCurrentThreadId()`，POSIX 是 `pthread_self()`，
+  FreeRTOS 是 `xTaskGetCurrentTaskHandle()`，裸机是 `0`。
+  **不用异步投递的工程不受影响**（该符号只在异步代码路径里被引用）。
 - **FreeRTOS 用户注意**：异步投递需要 `configUSE_COUNTING_SEMAPHORES = 1`，
   没打开时编译期直接 `#error`（而不是到运行期才出问题）。
-
-  时直接 `#include "FreeRTOS.h"`，而 Arduino-ESP32 / ESP-IDF 的头文件位于
+- **修正 FreeRTOS 头文件布局写死的问题**。原来 FreeRTOS 分支无条件地
+  直接 `#include "FreeRTOS.h"`，而 Arduino-ESP32 / ESP-IDF 的头文件位于
   `freertos/` 子目录，导致编译报 `FreeRTOS.h: No such file or directory`。
   现在 `mb_os.h` 与 `mb_os_freertos.c` 用 `__has_include` 自动探测两种布局
   （`freertos/FreeRTOS.h` 与根目录 `FreeRTOS.h`），无需工程侧额外配置。

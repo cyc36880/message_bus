@@ -119,19 +119,27 @@ static void sem_deadline(struct timespec *ts, uint32_t ms)
 bool mb_os_sem_wait(mb_sem_t *sem, uint32_t timeout_ms)
 {
     bool acquired = false;
+    struct timespec deadline = { 0, 0 };
+    bool timed = (timeout_ms != MB_WAIT_FOREVER);
 
     (void)pthread_mutex_lock(&sem->posix.mutex);
+
+    /* 截止时刻必须在进循环**之前**算好，而且只算一次。
+     * 放到循环里每醒一次重算，就把「最多等 timeout_ms」悄悄变成了
+     * 「连续睡满 timeout_ms」—— 条件变量每虚假唤醒一次，截止时刻就往后推一次，
+     * 实测等待可以远超调用方给的上限。而调用方（异步发布）正是拿这个上限
+     * 当承诺用的。 */
+    if (timed) {
+        sem_deadline(&deadline, timeout_ms);
+    }
 
     /* 必须写成循环：条件变量允许**虚假唤醒**，醒来不等于拿到了计数。 */
     while (sem->posix.count == 0) {
         int rc;
 
-        if (timeout_ms == MB_WAIT_FOREVER) {
+        if (!timed) {
             rc = pthread_cond_wait(&sem->posix.cond, &sem->posix.mutex);
         } else {
-            struct timespec deadline;
-
-            sem_deadline(&deadline, timeout_ms);
             rc = pthread_cond_timedwait(&sem->posix.cond, &sem->posix.mutex, &deadline);
         }
         if (rc != 0) {
@@ -191,6 +199,15 @@ void mb_os_sleep_ms(uint32_t ms)
     while (nanosleep(&ts, &ts) != 0) {
         /* 被信号打断时 nanosleep 会回填剩余时间，继续睡 */
     }
+}
+
+mb_thread_id_t mb_os_thread_id(void)
+{
+    /* pthread_t 是不透明类型：Linux 上是个整数，macOS 上是个指针。
+     * 两者强转成 uintptr_t 都成立 —— 库只拿它做相等比较，不解引用。
+     * 不用 pthread_equal() 是因为库那边要的是「整数标识」，
+     * 而这里正是把平台句柄收敛成整数的唯一位置。 */
+    return (mb_thread_id_t)pthread_self();
 }
 
 void *mb_os_malloc(size_t size)

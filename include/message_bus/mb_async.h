@@ -89,9 +89,13 @@ extern "C" {
  *         MB_ERR_NO_MEMORY    深拷贝失败
  *         MB_ERR_UNSUPPORTED  qos != 0，或编译期关闭了异步功能
  *         MB_ERR_STATE        总线正在销毁
+ *         MB_ERR_WOULD_DEADLOCK  在 mb_bus_pump() 的回调里调用，且 timeout_ms
+ *                                 是 MB_WAIT_FOREVER（见 mb_bus_pump 的警告）
  *
  * @note 本函数可以被任意多个线程并发调用，是线程安全的。
  * @note 消息的 id / timestamp_ms 在**入队时**确定，不是投递时。
+ * @note 返回 MB_ERR_WOULD_DEADLOCK 的调用**没有任何副作用**：没入队，
+ *       也不算「丢弃」（`stats.async_dropped` 与此无关）。
  */
 mb_err_t mb_node_publish_async(mb_node_t *node,
                                const char *topic,
@@ -148,6 +152,18 @@ mb_err_t mb_bus_publish_async(mb_bus_t *bus,
  * @warning 本函数**不阻塞**：队列空时立刻返回。请在专用线程里循环调用，
  *          并在两次调用之间自行 mb_os_sleep_ms()，否则会空转烧 CPU。
  * @warning 不要在某个回调里对本总线再调一次本函数（会返回 MB_ERR_BUSY）。
+ * @warning **从 pump 的回调里做 MB_WAIT_FOREVER 的异步发布会被拒绝**，
+ *          返回 MB_ERR_WOULD_DEADLOCK。回调跑在 pump 线程上，而给队列腾出空位的
+ *          正是 pump —— 它此刻正卡在你的回调里，永远等不到自己。库会比对
+ *          mb_os_thread_id() 识别出这种情况并直接拒绝（记一条 WARN），
+ *          而不是让程序挂死；被拒的调用没有任何副作用。
+ *          MB_WAIT_NONE 与具体毫秒数不受影响（后者不阻塞时照常成功，
+ *          真要阻塞就照常返回 MB_ERR_TIMEOUT 并计入 stats.async_dropped）。
+ *          要在回调里发布，就传 MB_WAIT_NONE，或改用
+ *          MB_PUB_FLAG_ASYNC_OVERWRITE / MB_CONFIG_ASYNC_OVERWRITE_OLDEST
+ *          走覆盖策略，并且同样传 MB_WAIT_NONE（覆盖 + 不等待时永不阻塞）。
+ * @note  裸机（MB_OS_NONE）不做上面这项检查：那里信号量本来就不会阻塞，
+ *        谈不上「等自己」，见 mb_os.h 的 MB_OS_CAN_BLOCK。
  */
 mb_err_t mb_bus_pump(mb_bus_t *bus);
 

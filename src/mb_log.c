@@ -88,6 +88,7 @@ const char *mb_err_to_string(mb_err_t err)
     case MB_ERR_TOO_LONG:       return "MB_ERR_TOO_LONG";
     case MB_ERR_UNSUPPORTED:    return "MB_ERR_UNSUPPORTED";
     case MB_ERR_TIMEOUT:        return "MB_ERR_TIMEOUT";
+    case MB_ERR_WOULD_DEADLOCK: return "MB_ERR_WOULD_DEADLOCK";
     default:                    return "MB_ERR_UNKNOWN";
     }
 }

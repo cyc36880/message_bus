@@ -24,6 +24,24 @@
 #if MB_CONFIG_ASYNC_MAX_TOPICS > 0
 
 /* -------------------------------------------------------------------------
+ * 队列深度不是一个固定数字
+ *
+ * 多条用例都要问「同一个主题里能不能同时积压两条」以及「总的能积压几条」，
+ * 答案跟 MB_CONFIG_ASYNC_QUEUE_DEPTH 走。深度 1 是**受支持的配置**
+ * （mb_config.h 只要求 >= 1，见那里的 #error），所以这些地方不能写死 2。
+ *
+ * 写成运行期常量而不是 #if，是为了让两个分支都保持可编译、可断言语义：
+ * 深度 1 时「再发一条」不是被跳过，而是被断言为返回 MB_ERR_TIMEOUT ——
+ * 那正是满队列账目该有的行为，顺带也验了它。
+ * ---------------------------------------------------------------------- */
+
+/** 同一主题内能否同时积压两条（需要深度 >= 2）。 */
+#define MB_ASYNC_TWO_PER_TOPIC (MB_CONFIG_ASYNC_QUEUE_DEPTH >= 2)
+
+/** 同一主题在深度之外能多积压几条：深度 >= 2 时是 1，深度 1 时是 0。 */
+#define MB_ASYNC_EXTRA_PER_TOPIC (MB_ASYNC_TWO_PER_TOPIC ? 1 : 0)
+
+/* -------------------------------------------------------------------------
  * 最小线程封装（与 test_threads.c 相同；两个文件各自独立编译）
  * ---------------------------------------------------------------------- */
 
@@ -267,17 +285,20 @@ MB_TEST(topics_queue_independently)
     bus = make_bus_with_sink("async4", "a/#", &log, &sink);
     MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
 
-    /* 往 "a/b" 连发两条，往 "a/c" 发一条 */
+    /* 往 "a/b" 连发两条，往 "a/c" 发一条。
+     * 深度 1 时同主题塞不下第二条，那一发应被正确拒绝 —— 下面断言它的返回码。 */
     MB_CHECK_INT(mb_node_publish_async(pub, "a/b", "1", 1, NULL, MB_WAIT_NONE), MB_OK);
-    MB_CHECK_INT(mb_node_publish_async(pub, "a/b", "2", 1, NULL, MB_WAIT_NONE), MB_OK);
+    MB_CHECK_INT(mb_node_publish_async(pub, "a/b", "2", 1, NULL, MB_WAIT_NONE),
+                 MB_ASYNC_TWO_PER_TOPIC ? MB_OK : MB_ERR_TIMEOUT);
     MB_CHECK_INT(mb_node_publish_async(pub, "a/c", "7", 1, NULL, MB_WAIT_NONE), MB_OK);
 
-    /* 两级结构：2 个主题条目，每个条目内各自排队 */
+    /* 两级结构：2 个主题条目，每个条目内各自排队。
+     * 深度 1 时 a/b 只进得去一条，"2" 被拒了，所以总量少一条。 */
     MB_CHECK_INT(mb_bus_async_topic_count(bus), 2);
-    MB_CHECK_INT(mb_bus_async_pending(bus), 3);
+    MB_CHECK_INT(mb_bus_async_pending(bus), 2 + MB_ASYNC_EXTRA_PER_TOPIC);
 
     MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
-    MB_CHECK_INT(log.count, 3);
+    MB_CHECK_INT(log.count, 2 + MB_ASYNC_EXTRA_PER_TOPIC);
 
     /* FIFO 保证是**每个主题内部**的，不是全局的：pump 在各主题条目之间轮转，
      * 免得一个刷屏的主题把别的主题饿死。因此这里按主题分别断言顺序。 */
@@ -299,13 +320,17 @@ MB_TEST(topics_queue_independently)
                 c_seen++;
             }
         }
-        MB_CHECK_INT(b_seen, 2);
+        MB_CHECK_INT(b_seen, 1 + MB_ASYNC_EXTRA_PER_TOPIC);
         MB_CHECK_INT(c_seen, 1);
 
         /* id 在**入队时**确定，不是投递时：投递顺序被轮转打乱了，
-         * 但 a/b 收到的两条 id 仍然递增，且都小于后入队的 a/c */
-        MB_CHECK(b_ids[0] < b_ids[1]);
-        MB_CHECK(b_ids[1] < c_id);
+         * 但 a/b 先入队的那条 id 仍小于后入队的 a/c。
+         * 「两条 a/b 之间递增」要深度 >= 2 才有第二条可断言。 */
+        MB_CHECK(b_ids[0] < c_id);
+        if (MB_ASYNC_TWO_PER_TOPIC) {
+            MB_CHECK(b_ids[0] < b_ids[1]);
+            MB_CHECK(b_ids[1] < c_id);
+        }
     }
 
     MB_CHECK_INT(mb_bus_async_topic_count(bus), 0);
@@ -337,13 +362,16 @@ MB_TEST(audience_capacity_is_per_topic_not_per_message)
     MB_CHECK_INT(mb_node_publish_async(pub, "t/new", "x", 1, NULL, MB_WAIT_NONE),
                  MB_ERR_TIMEOUT);
 
-    /* 但**已有**主题不受影响 —— 条目内部还有 3 个空位（深度 4，已放 1 条） */
-    MB_CHECK_INT(mb_node_publish_async(pub, "t/0", "y", 1, NULL, MB_WAIT_NONE), MB_OK);
-    MB_CHECK_INT(mb_bus_async_pending(bus), MB_CONFIG_ASYNC_MAX_TOPICS + 1);
+    /* 但**已有**主题不受影响 —— 条目内部还有空位，容量是按主题算的。
+     * 深度 1 时条目本身就是满的（只放了 1 条），这一发会被正确拒绝。 */
+    MB_CHECK_INT(mb_node_publish_async(pub, "t/0", "y", 1, NULL, MB_WAIT_NONE),
+                 MB_ASYNC_TWO_PER_TOPIC ? MB_OK : MB_ERR_TIMEOUT);
+    MB_CHECK_INT(mb_bus_async_pending(bus),
+                 MB_CONFIG_ASYNC_MAX_TOPICS + MB_ASYNC_EXTRA_PER_TOPIC);
 
     /* 腾空后条目名额全部归还，可以重新建主题 */
     MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
-    MB_CHECK_INT(log.count, MB_CONFIG_ASYNC_MAX_TOPICS + 1);
+    MB_CHECK_INT(log.count, MB_CONFIG_ASYNC_MAX_TOPICS + MB_ASYNC_EXTRA_PER_TOPIC);
     MB_CHECK_INT(mb_bus_async_topic_count(bus), 0);
     MB_CHECK_INT(mb_node_publish_async(pub, "t/fresh", "z", 1, NULL, MB_WAIT_NONE), MB_OK);
 
@@ -576,7 +604,12 @@ MB_TEST(overwrite_oldest_discards_the_head)
 
     MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
     MB_CHECK_INT(log.count, MB_CONFIG_ASYNC_QUEUE_DEPTH);
-    MB_CHECK_STR(log.payload[0], "1"); /* "0" 被覆盖掉了 */
+    /* "0" 被覆盖掉了，队列里剩下的是 1..N-1 再加 "99"。
+     * 深度 1 时只剩新消息这一条，没有「1」可断言 —— 那时 payload[0] 就是 "99"，
+     * 下面那行会覆盖到它。 */
+    if (MB_ASYNC_TWO_PER_TOPIC) {
+        MB_CHECK_STR(log.payload[0], "1");
+    }
     MB_CHECK_STR(log.payload[MB_CONFIG_ASYNC_QUEUE_DEPTH - 1], "99");
 
     mb_bus_destroy(bus);
@@ -647,17 +680,29 @@ MB_TEST(subscription_semantics_match_sync)
     sub_opts.user_data = &log;
     MB_CHECK_INT(mb_node_subscribe_ex(sink, &sub_opts, log_cb, NULL), MB_OK);
 
+    /* 三条消息**逐条发布 + 逐条 pump**：这样无论队列深度是多少都成立，
+     * 而且每条过滤规则被单独验证，失败时一眼能看出是哪一条漏了。
+     * （一次性发三条的话，深度 1 时后两条会因为同主题条目已满而被拒。） */
+
+    /* 主题与来源都匹配 → 投递 */
     MB_CHECK_INT(mb_node_publish_async(sensor, "sensor/1/value", "23", 2, NULL, MB_WAIT_NONE),
                  MB_OK);
-    MB_CHECK_INT(mb_node_publish_async(other, "sensor/1/value", "no", 2, NULL, MB_WAIT_NONE),
-                 MB_OK);
-    MB_CHECK_INT(mb_node_publish_async(sensor, "sensor/1/other", "no", 2, NULL, MB_WAIT_NONE),
-                 MB_OK);
-
     MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
-    MB_CHECK_INT(log.count, 1); /* 只有来源与主题都匹配的那条 */
+    MB_CHECK_INT(log.count, 1);
     MB_CHECK_STR(log.payload[0], "23");
     MB_CHECK_STR(log.source[0], "sensor0");
+
+    /* 主题匹配、来源不匹配 → 被 source_filter 挡掉 */
+    MB_CHECK_INT(mb_node_publish_async(other, "sensor/1/value", "no", 2, NULL, MB_WAIT_NONE),
+                 MB_OK);
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+    MB_CHECK_INT(log.count, 1);
+
+    /* 来源匹配、主题不匹配 → 被 filter 挡掉 */
+    MB_CHECK_INT(mb_node_publish_async(sensor, "sensor/1/other", "no", 2, NULL, MB_WAIT_NONE),
+                 MB_OK);
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+    MB_CHECK_INT(log.count, 1);
 
     mb_bus_destroy(bus);
 }
@@ -718,6 +763,91 @@ MB_TEST(pump_from_callback_is_rejected)
 
     /* 兜底标志必须被清掉：正常路径仍然可用 */
     MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+
+    mb_bus_destroy(bus);
+}
+
+/* -------------------------------------------------------------------------
+ * 用例：回调里做「会无限等」的异步发布
+ *
+ * 能归还主题条目空位的只有 mb_bus_pump() 自己。回调就是在 pump 里跑的，
+ * 所以从回调里发一条**无上限等待**的异步消息，等的是一个永远不会来的空位 ——
+ * 那是彻底挂死，连超时都报不出来。库必须提前拒绝。
+ *
+ * 这条用例同时钉住反面：有限超时**不能**被拦。往另一个还有空位的主题发布
+ * 根本不会阻塞，一刀切会把这种完全正常的写法一起挡掉。
+ * ---------------------------------------------------------------------- */
+
+static mb_node_t *g_cb_pub;
+static mb_err_t g_cb_forever;
+static mb_err_t g_cb_none;
+static mb_err_t g_cb_finite;
+static int g_cb_calls;
+
+static void blocking_publish_from_callback_cb(mb_subscription_t *sub,
+                                              const mb_message_t *msg,
+                                              void *user_data)
+{
+    (void)sub;
+    (void)msg;
+    (void)user_data;
+    g_cb_calls++;
+
+    g_cb_forever = mb_node_publish_async(g_cb_pub, "cb/forever", "x", 1, NULL, MB_WAIT_FOREVER);
+    g_cb_none = mb_node_publish_async(g_cb_pub, "cb/none", "x", 1, NULL, MB_WAIT_NONE);
+    g_cb_finite = mb_node_publish_async(g_cb_pub, "cb/finite", "x", 1, NULL, 5);
+}
+
+MB_TEST(blocking_publish_from_callback_is_rejected)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *pub = NULL;
+    mb_node_t *sink = NULL;
+    mb_bus_config_t config;
+    mb_bus_stats_t stats;
+
+    /* 关掉节点上线事件：否则两次 mb_node_create() 会各发一条没人订阅的
+     * 系统消息，把下面按条数核对统计的地方搅浑。 */
+    MB_CHECK_INT(mb_bus_default_config(&config), MB_OK);
+    config.publish_node_events = false;
+    MB_CHECK_INT(mb_bus_create_ex("async14b", &config, &bus), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "sink", &sink), MB_OK);
+    MB_CHECK_INT(mb_node_subscribe(sink, "a/b", blocking_publish_from_callback_cb, NULL, NULL),
+                 MB_OK);
+
+    g_cb_pub = pub;
+    g_cb_calls = 0;
+    g_cb_forever = MB_OK;
+    g_cb_none = MB_OK;
+    g_cb_finite = MB_OK;
+
+    MB_CHECK_INT(mb_node_publish_async(pub, "a/b", "x", 1, NULL, MB_WAIT_NONE), MB_OK);
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+
+    MB_CHECK_INT(g_cb_calls, 1);
+    MB_CHECK_INT(g_cb_forever, MB_ERR_WOULD_DEADLOCK);
+    MB_CHECK_INT(g_cb_none, MB_OK);
+    MB_CHECK_INT(g_cb_finite, MB_OK);
+
+    /* 被拒的那条不能留下任何痕迹：既没入队，也不算「丢弃」——
+     * 丢弃是「队列满、等超时」的账，这里压根没走到那一步。
+     *
+     * 注意 pending 是 0 而不是 2：回调里成功入队的两条会被**同一次** pump
+     * 顺带取走（pump 一直跑到队列空才返回），所以它们只体现在账目里。 */
+    MB_CHECK_INT(mb_bus_async_pending(bus), 0);
+    MB_CHECK_INT(mb_bus_get_stats(bus, &stats), MB_OK);
+    MB_CHECK_INT(stats.published, 3);      /* 被拒的那条不算发布 */
+    MB_CHECK_INT(stats.async_enqueued, 3); /* a/b + cb/none + cb/finite */
+    MB_CHECK_INT(stats.async_dropped, 0);
+    MB_CHECK_INT(stats.async_overwritten, 0);
+    MB_CHECK_INT(stats.no_subscriber, 2); /* cb/none 与 cb/finite 都没人订阅 */
+
+    /* pump 结束后「正在 pump」的标记必须被清干净：pump 线程之外
+     * 用 MB_WAIT_FOREVER 是合法调用，不能被这条新规则误伤。 */
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+    MB_CHECK_INT(mb_bus_async_pending(bus), 0);
+    MB_CHECK_INT(mb_node_publish_async(pub, "a/z", "x", 1, NULL, MB_WAIT_FOREVER), MB_OK);
 
     mb_bus_destroy(bus);
 }
@@ -891,6 +1021,109 @@ MB_TEST(concurrent_producers_single_pump)
 }
 
 /* -------------------------------------------------------------------------
+ * 用例：覆盖与阻塞两种生产者混在同一主题上，空位账目不能乱
+ *
+ * 针对一个真实存在过的 bug：普通生产者在**锁外**领空位令牌、到**锁内**才提交
+ * count++，两步之间留了一个「已预定未提交」的窗口，此时
+ * space.count == ASYNC_DEPTH - count - 1。覆盖路径原先假设
+ * 「count < DEPTH ⇒ 令牌一定拿得到」并在拿不到时断言，于是在这个窗口里
+ * 调试构建直接中止、量产构建则让空位账永久漂移（之后无故超时丢消息，
+ * 或环形队列写越界）。
+ *
+ * 触发条件是**两种模式混在同一个主题上**：
+ *   - 全用普通模式：没有覆盖路径，走不到那段代码；
+ *   - 全用覆盖模式：没人会「预定后慢慢提交」，窗口不成立。
+ * 所以这里两个线程发同一个 topic，一个带 OVERWRITE、一个不带，
+ * 都用 MB_WAIT_NONE 高频去撞那个窗口。
+ *
+ * 注意：把 MB_CONFIG_ASYNC_OVERWRITE_OLDEST 设为 1 时两边都变成覆盖模式，
+ * 这条用例不再触发上面那个窗口（但它仍然在验账目不变式）。
+ * ---------------------------------------------------------------------- */
+
+#define MIXED_THREADS 2
+#define MIXED_MSGS_PER_THREAD 2000
+
+typedef struct {
+    mb_node_t *node;
+    bool overwrite;
+} mixed_arg_t;
+
+static void mixed_producer_job(void *arg)
+{
+    mixed_arg_t *producer = (mixed_arg_t *)arg;
+    mb_publish_opts_t opts;
+    int i;
+
+    opts.flags = producer->overwrite ? MB_PUB_FLAG_ASYNC_OVERWRITE : 0u;
+    opts.qos = 0;
+
+    for (i = 0; i < MIXED_MSGS_PER_THREAD; ++i) {
+        /* 不阻塞：普通那一路会被拒（本次发布丢弃），覆盖那一路按契约必须成功 */
+        (void)mb_node_publish_async(producer->node, "mix/x", &i, sizeof(i),
+                                    &opts, MB_WAIT_NONE);
+    }
+}
+
+MB_TEST(mixed_modes_share_a_topic_without_corrupting_the_ledger)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *sink = NULL;
+    mb_node_t *pubs[MIXED_THREADS] = { NULL };
+    mixed_arg_t args[MIXED_THREADS];
+    thread_t threads[MIXED_THREADS];
+    thread_job_t descs[MIXED_THREADS];
+    thread_t pump_thread;
+    thread_job_t pump_desc;
+    mb_bus_stats_t stats;
+    char name[16];
+    int i;
+
+    MB_CHECK_INT(mb_bus_create("async17", &bus), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "sink", &sink), MB_OK);
+    MB_CHECK_INT(mb_node_subscribe(sink, "mix/#", count_atomic_cb, NULL, NULL), MB_OK);
+
+    g_async_delivered = 0;
+    g_producers_done = 0;
+
+    for (i = 0; i < MIXED_THREADS; ++i) {
+        snprintf(name, sizeof(name), "mixpub%d", i);
+        MB_CHECK_INT(mb_node_create(bus, name, &pubs[i]), MB_OK);
+        args[i].node = pubs[i];
+        args[i].overwrite = (i != 0); /* 0 号普通、1 号覆盖 */
+        descs[i].fn = mixed_producer_job;
+        descs[i].arg = &args[i];
+        MB_CHECK(thread_start(&threads[i], &descs[i]));
+    }
+
+    pump_desc.fn = pump_job;
+    pump_desc.arg = bus;
+    MB_CHECK(thread_start(&pump_thread, &pump_desc));
+
+    for (i = 0; i < MIXED_THREADS; ++i) {
+        thread_join(&threads[i]);
+    }
+    __atomic_store_n(&g_producers_done, 1, __ATOMIC_SEQ_CST);
+    thread_join(&pump_thread);
+
+    MB_CHECK_INT(mb_bus_get_stats(bus, &stats), MB_OK);
+
+    /* 端到端账目：队列已排空，所以每条入过队的消息最终只有两种归宿 ——
+     * 被 pump 投递出去，或被后来的覆盖顶掉。这两个数必须严丝合缝。
+     * 空位账一旦漂移，这里立刻对不上（不管是多算了还是少算了）。 */
+    MB_CHECK_INT((long long)stats.async_enqueued,
+                 (long long)__atomic_load_n(&g_async_delivered, __ATOMIC_SEQ_CST) +
+                     (long long)stats.async_overwritten);
+
+    /* 每条尝试要么进了队、要么被如实计入丢弃，不能既没进队也不记账 */
+    MB_CHECK_INT((long long)stats.async_enqueued + (long long)stats.async_dropped,
+                 (long long)MIXED_THREADS * MIXED_MSGS_PER_THREAD);
+
+    MB_CHECK_INT(mb_bus_async_pending(bus), 0);
+
+    mb_bus_destroy(bus);
+}
+
+/* -------------------------------------------------------------------------
  * 用例：销毁时不能泄漏队列里的消息
  * ---------------------------------------------------------------------- */
 
@@ -933,8 +1166,10 @@ static const mb_test_case_t cases[] = {
     MB_CASE(subscription_semantics_match_sync),
     MB_CASE(bus_level_publish_has_no_source),
     MB_CASE(pump_from_callback_is_rejected),
+    MB_CASE(blocking_publish_from_callback_is_rejected),
     MB_CASE(argument_validation),
     MB_CASE(concurrent_producers_single_pump),
+    MB_CASE(mixed_modes_share_a_topic_without_corrupting_the_ledger),
     MB_CASE(destroy_drains_queued_messages),
 };
 

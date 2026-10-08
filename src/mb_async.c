@@ -273,6 +273,7 @@ mb_err_t mb_bus_publish_async_internal(mb_bus_t *bus,
     mb_message_t view;
     uint8_t msg_flags;
     bool overwrite;
+    bool have_token = false;
     mb_err_t err;
 
     if (bus == NULL) {
@@ -283,6 +284,34 @@ mb_err_t mb_bus_publish_async_internal(mb_bus_t *bus,
     err = mb_publish_prepare(topic, payload, payload_len, opts, &options, &msg_flags);
     if (err != MB_OK) {
         return err;
+    }
+
+    /* 从 pump 线程发起**无上限**的等待，是个自相矛盾的请求：能给这个主题归还
+     * 空位的只有 pump 自己，而它此刻正卡在你的回调里，永远不会回来。提前拒绝，
+     * 而不是让调用方挂到天荒地老 —— 那是连超时都没机会报的挂死。
+     *
+     * 只拦 MB_WAIT_FOREVER，不拦有限超时：
+     *   - 有限超时不会真死锁，拿不到就如实返回 MB_ERR_TIMEOUT（计 async_dropped）；
+     *   - 回调里往「另一个还有空位的主题」发布是完全正常的用法，那种调用根本
+     *     不会阻塞，一刀切会把这些本来正确的代码一起挡掉。
+     * 而 MB_WAIT_FOREVER 表达的是「宁可一直等也不要丢」，从 pump 线程看这句
+     * 话无法兑现：队列空时不需要等，队列满时等不到。所以这里报的是死锁，
+     * 不是超时。 */
+    if (MB_OS_CAN_BLOCK && timeout_ms == MB_WAIT_FOREVER) {
+        bool from_pump;
+
+        MB_BUS_LOCK(bus);
+        from_pump = bus->pumping && (bus->pump_owner == mb_os_thread_id());
+        MB_BUS_UNLOCK(bus);
+
+        if (from_pump) {
+            MB_LOG_WARN("async", "mb_node_publish_async(MB_WAIT_FOREVER) called from "
+                                 "inside a pump callback on bus '%s'; the pump is the "
+                                 "only one who can free a slot, so this would hang "
+                                 "forever. Use MB_WAIT_NONE or the overwrite strategy.",
+                        bus->name);
+            return MB_ERR_WOULD_DEADLOCK;
+        }
     }
 
     /* 条目满时丢弃最旧的一条，而不是等。编译期默认值可以被单次调用的标志覆盖。 */
@@ -307,30 +336,55 @@ mb_err_t mb_bus_publish_async_internal(mb_bus_t *bus,
     }
 
     if (!overwrite) {
-        /* 先占一个空位，满了就在这里等 pump 把这个主题的消息取走。
-         * 等待发生在锁外，因此不阻塞其他线程。 */
+        /* 普通路径：先占一个空位，满了就在这里等 pump 把这个主题的消息取走。
+         * 等待必须发生在锁外 —— 可能睡很久，而归还空位的正是 pump 线程，
+         * 握着总线锁睡会把它一起锁死。 */
         if (!mb_os_sem_wait(entry->space, timeout_ms)) {
             entry_release_waiter(bus, entry);
             mb_owned_message_free(owned);
             count_dropped(bus);
             return MB_ERR_TIMEOUT;
         }
+        have_token = true;
     }
 
-    MB_BUS_LOCK(bus);
-    if (bus->destroying) {
-        MB_BUS_UNLOCK(bus);
-        if (!overwrite) {
-            (void)mb_os_sem_signal(entry->space); /* 没入队，归还刚占的空位 */
+    /* 空位令牌（entry->space）与 entry->count 的对应关系是全部记账依据：
+     *
+     *     space.count == ASYNC_DEPTH - count - 在途预定
+     *
+     * 「在途预定」= 已经领到令牌、但还没在锁内提交 count++ 的生产者。
+     * 上面普通路径的等待发生在两件事中间，所以这个中间状态真实存在，
+     * **谁也不能假设 count < ASYNC_DEPTH 就等于「令牌一定拿得到」**。
+     * 覆盖路径原来正是这么假设的（还写了 MB_CONFIG_ASSERT），
+     * 于是在混合模式下会真的断言失败 / 记账漂移 —— 这个循环就是为它写的。 */
+    for (;;) {
+        MB_BUS_LOCK(bus);
+
+        if (bus->destroying) {
+            MB_BUS_UNLOCK(bus);
+            if (have_token) {
+                (void)mb_os_sem_signal(entry->space); /* 没入队，归还刚占的空位 */
+            }
+            entry_release_waiter(bus, entry);
+            mb_owned_message_free(owned);
+            return MB_ERR_STATE;
         }
-        entry_release_waiter(bus, entry);
-        mb_owned_message_free(owned);
-        return MB_ERR_STATE;
-    }
 
-    if (overwrite) {
+        if (overwrite && !have_token) {
+            /* 覆盖路径先不阻塞地抢一个空位：抢到了就是普通入队，
+             * 抢不到再谈「覆盖」还是「等」。 */
+            have_token = mb_os_sem_wait(entry->space, MB_WAIT_NONE);
+        }
+
+        if (have_token) {
+            /* 有令牌 ⇒ 队列必然没满（满时 space.count 为 0，抢不到），
+             * 可以安全入队 —— 下面那个 count < DEPTH 的断言随之成立。 */
+            break;
+        }
+
+        /* 走到这里说明 space.count == 0，即 count + 在途预定 == ASYNC_DEPTH */
         if (entry->count == ASYNC_DEPTH) {
-            /* 覆盖：扔掉最旧的一条给新消息腾位置。
+            /* 情况一：队列真的满了，扔掉最旧的一条给新消息腾位置。
              * 先退队再入队，净效果 count 不变，所以既不消耗也不归还空位。 */
             mb_owned_message_t *oldest = entry->slots[entry->head];
 
@@ -339,13 +393,25 @@ mb_err_t mb_bus_publish_async_internal(mb_bus_t *bus,
             entry->count--;
             bus->stats.async_overwritten++;
             mb_owned_message_free(oldest);
-        } else {
-            /* 还有空位，正常占一个。此时计数 > 0，一定拿得到。 */
-            bool got = mb_os_sem_wait(entry->space, MB_WAIT_NONE);
-
-            MB_CONFIG_ASSERT(got);
-            (void)got;
+            break;
         }
+
+        /* 情况二：count < DEPTH 却拿不到令牌 —— 有别的普通生产者领了空位
+         * 还没提交，队列马上会被它填满。此刻既不构成「满」（不该覆盖丢消息），
+         * 也没空位可占。只能放锁等一个令牌：等到了说明它提交完了，
+         * 回到循环开头重新判断，那时 count 已经 == DEPTH，走上面的覆盖分支。 */
+        MB_BUS_UNLOCK(bus);
+
+        /* 用调用方给的超时。覆盖路径若传 MB_WAIT_NONE 就是不等 —— 直接放弃。
+         * 这个窗口很窄（另一个生产者夹在领令牌与提交之间），但等不到就必须
+         * 如实返回超时，而不是硬塞进去把账记坏。 */
+        if (!mb_os_sem_wait(entry->space, timeout_ms)) {
+            entry_release_waiter(bus, entry);
+            mb_owned_message_free(owned);
+            count_dropped(bus);
+            return MB_ERR_TIMEOUT;
+        }
+        have_token = true;
     }
 
     owned->id = ++bus->next_message_id;
@@ -445,6 +511,7 @@ mb_err_t mb_bus_pump(mb_bus_t *bus)
         return MB_ERR_BUSY;
     }
     bus->pumping = true;
+    bus->pump_owner = mb_os_thread_id();
     MB_BUS_UNLOCK(bus);
 
     for (;;) {
@@ -483,6 +550,7 @@ mb_err_t mb_bus_pump(mb_bus_t *bus)
 
     MB_BUS_LOCK(bus);
     bus->pumping = false;
+    bus->pump_owner = (mb_thread_id_t)0;
     MB_BUS_UNLOCK(bus);
     return MB_OK;
 }
