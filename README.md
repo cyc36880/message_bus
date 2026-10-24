@@ -52,6 +52,15 @@ mb_node_subscribe(motor, "motor/cmd", on_command, NULL, NULL);
   发布方不再被刷屏拖慢。订阅端一行都不用改。
 - **异步队列按主题分组**：`"a/b"` 与 `"a/c"` 互不挤占；队列满时可选
   「等一会儿」或「覆盖最旧的」。
+- **异步投递可以等消费完再走**：`mb_node_publish_async_wait()` 在超时内阻塞，
+  直到 pump 把这条消息投递给所有匹配订阅者、回调返回为止。多线程握手
+  （发命令 → 确认已执行 → 读结果）不用自己搭条件变量，而回调仍然跑在
+  pump 线程上。超时则当场撤销未投递的消息，不会「迟到的回调」。
+- **非阻塞推送 + 完成回调**：`*_async_notify()` 立即返回，不卡调用线程；
+  成功、超时、无人订阅、入队失败都会在 pump 线程回调一次，并给出
+  `elapsed_since_publish_ms`（从本次推送调用到回调触发的实测间隔）与原始
+  topic / payload / opts —— 失败时可在回调里直接重试。
+  典型用法是点击 UI 后显示等待遮罩，结果出来再在回调里关闭遮罩。
 - **线程安全**：总线内嵌递归互斥锁 + 引用计数。回调**一律在锁外**执行，
   因此回调里可以安全地 publish / subscribe / unsubscribe，**包括取消自己**。
 - **零动态分配的余地**：内存走可替换的钩子，可接静态内存池；
@@ -181,7 +190,7 @@ CMake 下 `-DMB_OS=auto`（默认）会按平台自动选择。
 | 文档 | 内容 |
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | **架构说明**：数据结构、投递算法、**异步队列与 pump**、线程与内存模型、优点、**代价与局限**、踩坑清单 |
-| [docs/api.md](docs/api.md) | 按模块的 API 参考，含可运行片段（异步部分见第 8 节） |
+| [docs/api.md](docs/api.md) | 按模块的 API 参考，含可运行片段（异步与 await 见第 8 节） |
 | [docs/porting.md](docs/porting.md) | 移植到 FreeRTOS / 裸机 / 新 RTOS，含任务骨架代码 |
 | [docs/topics.md](docs/topics.md) | 主题与通配符规范、MQTT 对照表、状态 vs 事件的取舍 |
 | [tools/README.md](tools/README.md) | **可视化设计器**：节点多到理不清时，用网页手工梳理总线/节点/发布/订阅，数据存 XML，并按配置实时显示对应的 C 代码 |
@@ -283,8 +292,8 @@ message_bus/
 │   ├── mb_os_freertos.c   #   ★ MCU 目标平台
 │   └── mb_os_none.c       #   裸机
 ├── config/mb_conf_template.h   # 复制到你的工程里改
-├── examples/              # 4 个可运行示例
-├── tests/                 # 600+ 条断言，CTest 驱动，无第三方依赖
+├── examples/              # 6 个可运行示例（05 await / 06 非阻塞 UI 遮罩）
+├── tests/                 # 932 条断言，CTest 驱动，无第三方依赖
 ├── docs/                  # 架构 / API / 移植 / 主题
 ├── tools/                 # 可视化设计器（纯前端，不参与 C 构建）
 │   ├── message-bus-designer.html   #   ★ 单文件、零依赖，双击即可用
@@ -309,7 +318,7 @@ message_bus unit tests
   async (async delivery)
   threads (thread safety)
 
-650 assertions, 0 failed
+932 assertions, 0 failed
 ALL PASSED
 ```
 
@@ -321,6 +330,17 @@ ALL PASSED
 （生产者用 `MB_WAIT_FOREVER`，一条都不许丢），以及回调里发布的三种超时：
 `MB_WAIT_FOREVER` 被拒（`MB_ERR_WOULD_DEADLOCK`，否则必然死锁），
 `MB_WAIT_NONE` 与具体毫秒数照常成功。
+
+`await` 相关用例单独钉住新语义：发布方线程在 pump 投递前确实阻塞、返回时回调
+已经跑完、超时后消息被当场撤销（`async_canceled`）且不会迟到投递、队列满的
+总超时预算、被覆盖策略顶掉时返回 `MB_ERR_DROPPED`，以及 100 轮双向握手
+（每轮都断言发布方读到的值一定是回调写入的那一轮）。pump 回调里等待消费
+被拒（`MB_ERR_WOULD_DEADLOCK`）也各有一条用例。
+
+`notify` 用例验证的是「不阻塞」本身：推送函数在队列满时也必须立刻返回；
+回调在 pump 线程上才出现；成功、`MB_ERR_NO_SUBSCRIBER`、`MB_ERR_TIMEOUT`
+三条结果路径；`elapsed_since_publish_ms` 从推送时刻开始计；失败回调拿到的
+topic / payload 可以原样重试并成功；参数非法时既不排队也不留下回调。
 
 CI 在 Linux 上除了跑一遍 **ASan + UBSan**，还会跑一遍 **ThreadSanitizer** ——
 前者抓内存错误，后者抓数据竞争，两者不能共存于同一个二进制，所以各是一个 job。
@@ -336,6 +356,12 @@ CI 在 Linux 上除了跑一遍 **ASan + UBSan**，还会跑一遍 **ThreadSanit
 - **裸机上异步投递无法真正阻塞**：满队列一律退化成 `MB_ERR_TIMEOUT`，
   建议改用覆盖策略或直接关掉异步。详见
   [porting.md § 2.1](docs/porting.md#21-裸机上没有真正的阻塞)。
+- **等待消费（await）有额外代价**：每次调用多一次小的堆分配（回执 + 信号量），
+  等待期间发布方线程被占住，且不能在 pump 回调里调用。它适合关键同步点，
+  不适合高频数据通路；裸机上会立刻返回 `MB_ERR_TIMEOUT`。
+- **完成通知（notify）依赖 pump 驱动**：超时只在 `mb_bus_pump()` 调用时检查，
+  pump 不跑就永远不会有回调；销毁总线不会补发未完成的通知。它每次推送多两次
+  小的堆分配，适合低频 UI 命令，不适合高频数据通路。
 - **QoS 仅支持 0**：`opts.qos != 0` 返回 `MB_ERR_UNSUPPORTED`。
 - **进程内**：这不是网络 MQTT，没有 broker、没有跨设备通信。
 - **单锁串行**：订阅表是 O(n) 线性扫描。几十个订阅、每秒几千条消息没问题；

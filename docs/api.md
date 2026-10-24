@@ -41,9 +41,11 @@ typedef enum mb_err {
     MB_ERR_STATE        = -7,  /* 对象状态不允许该操作（如总线正在销毁） */
     MB_ERR_TOO_LONG     = -8,  /* 超过配置的长度上限 */
     MB_ERR_UNSUPPORTED  = -9,  /* 当前平台/配置不支持（如 qos != 0） */
-    MB_ERR_TIMEOUT      = -10, /* 异步发布时队列满，等到超时仍没有空位 */
+    MB_ERR_TIMEOUT      = -10, /* 异步发布等队列空位超时，或 await 等消费超时 */
     MB_ERR_WOULD_DEADLOCK = -11,/* 这次调用会永久卡死，已被拒绝（pump 回调里做
-                                 * MB_WAIT_FOREVER 的异步发布） */
+                                 * MB_WAIT_FOREVER 的异步发布 / 等待消费） */
+    MB_ERR_DROPPED      = -12, /* 消息在等待投递期间被丢弃（如被覆盖策略顶掉） */
+    MB_ERR_NO_SUBSCRIBER = -13,/* 消息已处理，但没有任何订阅者消费它（notify 专用） */
 } mb_err_t;
 
 const char *mb_err_to_string(mb_err_t err);   /* → "MB_ERR_NOT_FOUND" */
@@ -114,6 +116,7 @@ printf("发布 %llu 条，投递 %llu 次，无人订阅 %llu，丢弃 %llu\n",
 | `async_enqueued` | 累计成功进入异步队列的条数 | 与 `published` 对照，看有多少走了异步 |
 | `async_dropped` | 因队列满、等待超时没能入队的条数 | **不为 0 就是真丢了消息**，要么加大队列/超时，要么改用覆盖策略 |
 | `async_overwritten` | 因「覆盖最旧」被顶掉的旧消息条数 | 覆盖是刻意丢的；偏高说明消费端跟不上生产端 |
+| `async_canceled` | 已入队、但等待消费/完成超时后被撤销的条数 | 偏高说明 pump 太慢或根本没在跑；这些消息不会再投递 |
 
 > ⚠️ `mb_bus_find_node()` 返回的是**借用指针**：只要没有其它线程销毁该节点就一直有效。
 > 多线程下若可能并发销毁，请自行用外部机制保护，或改用
@@ -522,6 +525,168 @@ mb_node_publish_async(sensor, "sensor/temp/value", buf, len, &opts, MB_WAIT_NONE
 >
 > 回调里要发布就传 `MB_WAIT_NONE`，或用 `MB_PUB_FLAG_ASYNC_OVERWRITE`
 > 走覆盖策略，**并且同样传 `MB_WAIT_NONE`**（覆盖 + 不等待时永不阻塞）。
+>
+> 同理，**`*_async_wait()` 在 pump 回调里一律被拒绝**（返回
+> `MB_ERR_WOULD_DEADLOCK`）：它要等的那条消息只有当前 pump 返回后才能被取走，
+> 而 pump 正卡在你的回调里。`MB_WAIT_NONE` 不受影响（那只是入队）。
+
+### 发布并等待消费（await）
+
+```c
+mb_err_t mb_node_publish_async_wait(mb_node_t *node, const char *topic,
+                                    const void *payload, size_t payload_len,
+                                    const mb_publish_opts_t *opts,
+                                    uint32_t timeout_ms, size_t *out_delivered);
+mb_err_t mb_node_publish_to_async_wait(mb_node_t *node, const char *dst_node,
+                                       const char *subtopic, const void *payload,
+                                       size_t payload_len,
+                                       const mb_publish_opts_t *opts,
+                                       uint32_t timeout_ms, size_t *out_delivered);
+mb_err_t mb_bus_publish_async_wait(mb_bus_t *bus, const char *topic,
+                                   const void *payload, size_t payload_len,
+                                   const mb_publish_opts_t *opts,
+                                   uint32_t timeout_ms, size_t *out_delivered);
+```
+
+普通异步发布返回 `MB_OK` 只代表**入队成功**；await 版本把「pump 已经把这条消息
+投递给所有匹配订阅者、并且回调都返回了」当作成功条件：
+
+```
+    A 线程（发布方）                          B 线程（pump）
+    ─────────────                           ─────────────
+    publish_async_wait(cmd, 100)  ──入队──►
+        │ 阻塞等待                              pump() ──► on_cmd()
+        ▼                                            │
+    返回：回调已执行完  ◄────────── ack ─────────────┘
+```
+
+这样 A 可以在返回后立刻读取「命令生效后的结果」，而回调仍然跑在 B 的线程上。
+它把「异步换线程」和「同步握手」两件事合到了一起，适合命令确认、
+请求-应答、逐帧动画推进这类**关键同步点**。
+
+| 返回值 | 含义 |
+|---|---|
+| `MB_OK` | 已投递完毕；`out_delivered` 是实际执行的回调次数（0 = 没有任何订阅者命中） |
+| `MB_ERR_TIMEOUT` | 总预算用完。消息若还在队列里会被**当场撤销**，不会再投递（计入 `async_canceled`）；若 pump 已经取走、回调正在跑，则回调可能仍会执行 |
+| `MB_ERR_DROPPED` | 等待期间被别的发布的「覆盖最旧」策略顶掉了 |
+| `MB_ERR_BUSY` | 投递时超过 `MB_CONFIG_MAX_DISPATCH_DEPTH`（回调里有发布环），没有投递 |
+| `MB_ERR_WOULD_DEADLOCK` | 在 pump 回调里调用（`MB_WAIT_NONE` 除外）：消费它的正是当前被占住的 pump |
+| `MB_ERR_INVALID_ARG` | 参数非法，或等待模式下同时用了 `MB_PUB_FLAG_ASYNC_OVERWRITE` |
+| 其余 | 与 `mb_node_publish_async()` 相同 |
+
+`timeout_ms` 是**总预算**，同时覆盖「等队列空位」和「等 pump 消化」两段。
+`MB_WAIT_NONE` 表示只入队（等价于普通异步发布），`MB_WAIT_FOREVER` 表示一直等。
+
+```c
+/* UI 线程：下发命令，并等电机回调确认执行完，再读状态 */
+size_t delivered = 0;
+mb_err_t err = mb_node_publish_async_wait(ui, "motor/cmd", "speed=1200", 10,
+                                          NULL, 200, &delivered);
+if (err == MB_OK && delivered > 0) {
+    /* 到这里 on_command() 已经返回，g_motor_speed 一定是新值 */
+    printf("motor speed = %d\n", g_motor_speed);
+} else if (err == MB_ERR_TIMEOUT) {
+    /* 消息已撤销，不会「迟到的回调」；可以安全地重试或报错 */
+}
+```
+
+**限制与代价**：
+
+- **等待模式（`timeout_ms != MB_WAIT_NONE`）下不能和
+  `MB_PUB_FLAG_ASYNC_OVERWRITE` 同时用**（返回 `MB_ERR_INVALID_ARG`）；
+  编译期默认值 `MB_CONFIG_ASYNC_OVERWRITE_OLDEST` 对 await 消息**不生效** ——
+  「等它被消化」和「允许它被顶掉」互相矛盾。不过别的发布者仍可能覆盖它，
+  此时返回 `MB_ERR_DROPPED`。`MB_WAIT_NONE` 等价于普通异步发布，不受此限制。
+- **不能在 `mb_bus_pump()` 的回调里等待**（`MB_WAIT_NONE` 除外）。
+- **裸机（`MB_OS_NONE`）无法真正阻塞**：入队后会立刻撤销并返回
+  `MB_ERR_TIMEOUT`；裸机上请用普通异步发布 + 轮询。
+- 每次调用多一次小的堆分配（回执 + 信号量）。它是给关键握手点用的，
+  不要拿来做高频数据通路。
+- 销毁总线前必须让所有 await 调用先返回（与其它 API 的销毁契约一致）。
+
+### 非阻塞推送 + 完成回调（notify）
+
+```c
+mb_err_t mb_node_publish_async_notify(mb_node_t *node, const char *topic,
+                                      const void *payload, size_t payload_len,
+                                      const mb_publish_opts_t *opts, uint32_t timeout_ms,
+                                      mb_async_done_handler_t on_done, void *user_data);
+mb_err_t mb_node_publish_to_async_notify(...);   /* 定向版本 */
+mb_err_t mb_bus_publish_async_notify(...);       /* 总线级版本 */
+```
+
+与 await 的区别：**推送函数立刻返回，不阻塞调用线程**；成功 / 超时 / 入队失败
+都会在之后由 pump 线程调用一次 `on_done`。典型场景是「点击 UI → 显示等待遮罩 →
+推送命令」，在回调里关闭遮罩：
+
+```c
+static void on_command_done(const mb_async_result_t *r, void *user_data)
+{
+    hide_overlay();                                  /* 回调在 pump 线程上 */
+    if (!r->success) {
+        show_error(mb_err_to_string(r->status));     /* 超时 / 无订阅者 ... */
+    }
+}
+
+void on_button_click(void)
+{
+    show_overlay();
+    mb_node_publish_async_notify(ui, "motor/cmd", "speed=1200", 10, NULL,
+                                 200, on_command_done, NULL);
+    /* 这里立刻继续执行，UI 照常渲染，遮罩不会卡住 */
+}
+```
+
+`mb_async_result_t` 的字段：
+
+| 字段 | 含义 |
+|---|---|
+| `success` | 是否至少有一个订阅者消费了这条消息 |
+| `status` | `MB_OK` / `MB_ERR_TIMEOUT` / `MB_ERR_NO_SUBSCRIBER` / `MB_ERR_DROPPED` / ... |
+| `delivered` | 实际执行的回调次数 |
+| `elapsed_since_publish_ms` | 从调用**本次**推送函数到**这次回调触发**的实测毫秒数（记录/调优用；重试会重新计时） |
+| `bus` / `node` | 总线与发布者节点；总线级推送时 `node == NULL` |
+| `source` | 发布者节点名；总线级推送时为 `NULL` |
+| `topic` / `payload` / `payload_len` | 原始请求的深拷贝，回调期间有效 |
+| `opts` / `requested_timeout_ms` | 原始发布选项与超时**配置**，只用于重试复用；不是实际等待时间 |
+| `handler` / `user_data` | 本次注册的回调与用户指针 |
+
+> ⚠️ 别把 `requested_timeout_ms` 当成实际等待时间：它只是你调用推送函数时传入的
+> 超时配置（方便原样重试）。**实际间隔请读 `elapsed_since_publish_ms`** ——
+> 它从本次推送调用开始计时，到回调真正触发时结束，单位毫秒。
+
+失败时可以直接用这些字段重试：
+
+```c
+static void on_command_done(const mb_async_result_t *r, void *user_data)
+{
+    int *retries = user_data;
+
+    hide_overlay();
+    if (!r->success && (*retries)-- > 0) {
+        show_overlay();
+        mb_node_publish_async_notify(r->node, r->topic, r->payload, r->payload_len,
+                                     &r->opts, r->requested_timeout_ms,
+                                     on_command_done, retries);
+    }
+}
+```
+
+**回调时机与 pump 的关系**（最重要的一条）：
+
+- 库**不创建定时器**。超时是在下一次 `mb_bus_pump()` 里检查并触发的；
+  pump 不被驱动，回调就永远不会来。LVGL 场景由定时器驱动 pump，正好合适。
+- 回调在 pump 线程、锁外执行，可以安全地操作 LVGL 控件、publish / subscribe。
+- 不能在回调里再次调用 `mb_bus_pump()`（返回 `MB_ERR_BUSY`）。
+- 消息被 pump 处理但**没有任何订阅者**时，status 为 `MB_ERR_NO_SUBSCRIBER`，
+  `success == false`。这与普通发布的「无人订阅不算错误」不同 —— 通知的语义
+  就是「等一个消费者」。
+- 推送函数内部用 `MB_WAIT_NONE` 入队：队列满也**不会**阻塞，直接登记失败通知。
+- `MB_WAIT_FOREVER` 表示只等成功/失败，不因超时回调。
+- 不支持 `MB_PUB_FLAG_ASYNC_OVERWRITE`（返回 `MB_ERR_INVALID_ARG`），
+  否则「等它被消化」会被覆盖策略破坏。
+- 销毁总线时不会为未完成通知触发回调，它们会被直接释放；先让 pump 出结果。
+- 每次推送多两次小的堆分配（请求拷贝 + 通知/回执），适合低频关键路径。
 
 ### 队列处理
 
@@ -531,6 +696,8 @@ mb_err_t mb_bus_pump(mb_bus_t *bus);
 
 取出队列里**当前积压的全部**消息，逐条投递给匹配的订阅者。
 这是异步队列的**唯一消费点**，也是异步订阅的回调真正被执行的地方。
+同时它也负责推进 `*_async_notify()` 的完成回调与超时检查 —— 所以 pump
+必须持续被调用，通知回调才会按时出现。
 
 | 返回值 | 含义 |
 |---|---|
@@ -590,8 +757,10 @@ printf("积压 %zu 条，占用 %zu 个主题\n",
 
 ### 关闭顺序
 
-`mb_bus_destroy()` **不会**唤醒阻塞在队列上的发布者（那样只会把一个安静睡着的
-线程变成正在解引用的线程）。所以销毁前必须先把所有线程 join 掉：
+`mb_bus_destroy()` **不保证安全地唤醒**阻塞在队列上的发布者（那样只会把一个
+安静睡着的线程变成正在解引用的线程）。所以销毁前必须先把所有线程 join 掉 ——
+包括正在 `*_async_wait()` 里等回执的线程。库**不保证**在销毁时安全唤醒等待者：
+销毁流程可能已经释放总线，等待线程醒来后不能再碰它。
 
 ```c
 /* ✅ 正确的关闭顺序（生产者不会永久阻塞时） */

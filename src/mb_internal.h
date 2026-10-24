@@ -35,7 +35,33 @@
 #define MB_BUS_UNLOCK(bus) mb_os_mutex_unlock((bus)->lock)
 
 /* -------------------------------------------------------------------------
- * 内部拥有的消息（深拷贝），仅 retained 表使用。
+ * 异步回执（await 发布用）
+ *
+ * 发布方要在「消息被 pump 消化完」之后再继续执行，必须有一个能跨线程等待、
+ * 又不依赖消息对象存活的对象 —— 消息可能在发布方醒来之前就被 pump 释放。
+ * 因此单独分配一个引用计数的回执：
+ *
+ *     refcnt = 1（发布方） + 1（队列里的那条消息）
+ *
+ * 消息投递完 → 结束回执（signal done）并归还消息那份引用；
+ * 发布方醒来 → 读结果并归还自己那份引用；归零才真正释放。
+ *
+ * 所有字段都在**总线锁内**读写（done 信号量本身除外）。
+ * 关闭异步功能时这个类型仍然保留，只是没有任何代码使用它。
+ * ---------------------------------------------------------------------- */
+typedef struct mb_async_ack {
+    mb_sem_t *done;   /**< 完成/放弃时 +1；await 用；notify 回执为 NULL */
+    uint32_t refcnt;  /**< 见上：发布方/通知 1 + 队列消息 1 */
+    bool completed;   /**< 已经结束（投递完 / 被撤销 / 被覆盖 / 总线销毁） */
+    bool dispatching; /**< pump 已取出、正在锁外跑回调；此时无法再撤销 */
+    bool canceled;    /**< 发布方等超时，pump 取到后应跳过并释放 */
+    mb_err_t status;  /**< 结束原因：MB_OK 表示已正常投递 */
+    size_t delivered; /**< 投递到的回调次数 */
+    struct mb_async_notify *notify; /**< 非 NULL 时把结果转写给完成通知 */
+} mb_async_ack_t;
+
+/* -------------------------------------------------------------------------
+ * 内部拥有的消息（深拷贝），retained 表与异步队列共用。
  * 普通投递是零拷贝的：回调期间直接引用调用方的缓冲区。
  * ---------------------------------------------------------------------- */
 typedef struct mb_owned_message {
@@ -46,7 +72,42 @@ typedef struct mb_owned_message {
     uint32_t id;
     uint32_t timestamp_ms;
     uint8_t flags;
+#if MB_CONFIG_ASYNC_MAX_TOPICS > 0
+    /**
+     * 异步回执；普通消息为 NULL。
+     * 由异步队列在投递/丢弃时负责结束并归还那一份引用，
+     * 因此 mb_owned_message_free() 看到非 NULL 就是内部错误。
+     */
+    mb_async_ack_t *ack;
+#endif
 } mb_owned_message_t;
+
+/* -------------------------------------------------------------------------
+ * 异步推送完成通知（publish_async_notify）
+ *
+ * 每个通知持有：
+ *   - 一份原始请求的深拷贝（request），供回调读取 / 重试；
+ *   - 一个 ack，用来接收投递结果或撤销队列里的消息；
+ *   - 发布者节点的引用（node），保证回调期间 result->node 不会悬垂。
+ *
+ * 通知对象挂在本总线的链表中，由 mb_async_notify_service() 在
+ * mb_bus_pump() 的线程上逐个取出发起回调。
+ * ---------------------------------------------------------------------- */
+typedef struct mb_async_notify {
+    struct mb_async_notify *next;
+    mb_bus_t *bus;
+    mb_node_t *node;             /**< 已持有引用；总线级推送为 NULL */
+    mb_owned_message_t *request; /**< 原始请求的深拷贝 */
+    mb_publish_opts_t opts;      /**< 归一化后的发布选项 */
+    mb_async_done_handler_t handler;
+    void *user_data;
+    mb_async_ack_t *ack; /**< 结果来自这里；通知持有 ack 的一份引用 */
+    uint32_t start_ms;   /**< 调用推送函数的时刻 */
+    uint32_t timeout_ms; /**< 原始超时 */
+    bool resolved;       /**< 结果已确定（成功 / 失败 / 超时） */
+    mb_err_t status;
+    size_t delivered;
+} mb_async_notify_t;
 
 /* -------------------------------------------------------------------------
  * retained 保留消息表项（链表，按 seq 升序）
@@ -158,6 +219,9 @@ struct mb_bus {
      * 用来拦下「从 pump 回调里做会阻塞的异步发布」——那必然死锁。见 mb_os.h。
      */
     mb_thread_id_t pump_owner;
+    /** 待完成回调的异步通知链表（按发布顺序，尾部追加）。 */
+    mb_async_notify_t *async_notifies;
+    mb_async_notify_t *async_notify_tail;
 #endif
 };
 
@@ -221,6 +285,52 @@ mb_err_t mb_bus_publish_async_internal(mb_bus_t *bus,
                                        size_t payload_len,
                                        const mb_publish_opts_t *opts,
                                        uint32_t timeout_ms);
+
+/**
+ * 带异步回执的发布：成功入队后消息持有一份 ack 引用，
+ * pump 投递完（或丢弃）时结束回执并唤醒等待者。
+ * ack 为 NULL 时等价于 mb_bus_publish_async_internal()。
+ */
+mb_err_t mb_bus_publish_async_ack_internal(mb_bus_t *bus,
+                                           const char *source,
+                                           const char *topic,
+                                           const void *payload,
+                                           size_t payload_len,
+                                           const mb_publish_opts_t *opts,
+                                           uint32_t timeout_ms,
+                                           mb_async_ack_t *ack);
+
+/**
+ * 「入队并等待被 pump 消化」的公共实现：
+ * 成功返回时所有匹配订阅者的回调都已在 **pump 线程**上执行完毕。
+ */
+mb_err_t mb_bus_publish_async_wait_internal(mb_bus_t *bus,
+                                            const char *source,
+                                            const char *topic,
+                                            const void *payload,
+                                            size_t payload_len,
+                                            const mb_publish_opts_t *opts,
+                                            uint32_t timeout_ms,
+                                            size_t *out_delivered);
+
+/**
+ * 「非阻塞推送 + 完成回调」的公共实现。
+ * 返回 MB_OK 表示通知已登记；成功/失败结果都会在后续 mb_bus_pump() 里
+ * 通过 handler 回调给出。
+ */
+mb_err_t mb_bus_publish_async_notify_internal(mb_bus_t *bus,
+                                              mb_node_t *node,
+                                              const char *source,
+                                              const char *topic,
+                                              const void *payload,
+                                              size_t payload_len,
+                                              const mb_publish_opts_t *opts,
+                                              uint32_t timeout_ms,
+                                              mb_async_done_handler_t handler,
+                                              void *user_data);
+
+/** 释放所有待完成通知（不回调）；由 mb_async_pool_dispose 调用。 */
+void mb_async_notify_dispose_locked(mb_bus_t *bus);
 
 /** 释放异步队列（连同队列里还没投递的消息）。由 mb_bus_destroy 调用。 */
 void mb_async_pool_dispose(mb_bus_t *bus);

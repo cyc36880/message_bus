@@ -10,13 +10,15 @@ git clone <repo-url> && cd message_bus
 
 cmake --preset debug          # 或 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build --preset debug --parallel
-ctest --preset debug          # 326 条断言必须全绿
+ctest --preset debug          # 932 条断言必须全绿
 
 # 跑一遍示例，肉眼确认输出符合预期
 ./build/debug/bin/example_01_basic_pubsub
 ./build/debug/bin/example_02_wildcards_filter
 ./build/debug/bin/example_03_lvgl_motor_sensor
 ./build/debug/bin/example_04_node_events
+./build/debug/bin/example_05_async_await
+./build/debug/bin/example_06_async_notify_overlay
 ```
 
 不想用 presets 的话，等价的手工命令：
@@ -90,6 +92,18 @@ ctest --test-dir build --output-on-failure
 
 5. **新增投递路径必须收敛到 `mb_dispatch.c`**。将来若要改成异步队列/分发线程，
    只需要改这一个文件。请勿在别处直接遍历 `bus->subs` 调回调。
+
+6. **异步回执（`mb_async_ack_t`）的每一份引用都必须有归宿**。
+   消息入队时 `refcnt++`，投递完 / 撤销 / 被覆盖 / 总线销毁时调用
+   `ack_finish_locked()` 归还消息那一份，发布方醒来后归还自己那一份。
+   漏掉任何一条路径，`*_async_wait()` 就会永远等下去（或 use-after-free）；
+   重复归还会提前释放回执，让等待者读到已释放内存。
+   发送路径新增分支时，先问一句「这条消息的 ack 谁来结束？」
+
+7. **notify 还多一层通知生命周期**。`ack->notify` 指向 `bus->async_notifies`
+   链表里的通知对象；回调返回前不能释放通知、请求拷贝或节点引用。
+   超时撤销必须复用 `queue_remove_by_ack_locked()` 并归还条目空位；
+   销毁路径由 `mb_async_notify_dispose_locked()` 统一清理（不触发回调）。
 
 ## 提交信息
 

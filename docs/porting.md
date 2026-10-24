@@ -370,6 +370,8 @@ int main(void)
 |---|---|
 | `mb_node_publish_async(..., MB_WAIT_FOREVER)` | 退化成不等待；队列满时立刻返回 `MB_ERR_TIMEOUT` |
 | `mb_node_publish_async(..., 100)` | 同上（超时参数被忽略） |
+| `mb_node_publish_async_wait(...)` | 入队后立刻按「等不到消费」处理：撤销消息并返回 `MB_ERR_TIMEOUT` |
+| `mb_node_publish_async_notify(...)` | 正常工作；回调与超时都在 `mb_bus_pump()` 里触发，不依赖阻塞原语 |
 | 条目名额用尽时发布新主题 | 同上 |
 | `mb_bus_pump()` | 与其它平台一致（本来就不阻塞） |
 
@@ -551,8 +553,8 @@ void mb_os_sem_destroy(mb_sem_t *sem)
 
 ### 4.2 `mb_os_thread_id()`：识别 pump 线程
 
-用来拦住「从 `mb_bus_pump()` 的回调里做会无限等待的异步发布」这种必然死锁的
-调用（回调跑在 pump 线程上，而腾出空位的正是 pump 自己，见
+用来拦住「从 `mb_bus_pump()` 的回调里做会无限等待的异步发布 / 等待消费」这种
+必然死锁的调用（回调跑在 pump 线程上，而腾出空位的正是 pump 自己，见
 [architecture.md 第 4 节](architecture.md#回调里发布要走覆盖策略不能阻塞)）。
 库只拿它做**相等比较**，所以任何「同一线程恒定、不同线程互异」的整数都行：
 

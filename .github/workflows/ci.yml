@@ -96,6 +96,8 @@ jobs:
           ./build/bin/example_02_wildcards_filter
           ./build/bin/example_03_lvgl_motor_sensor
           ./build/bin/example_04_node_events
+          ./build/bin/example_05_async_await
+          ./build/bin/example_06_async_notify_overlay
         shell: bash
 
   # ---------------------------------------------------------------------------

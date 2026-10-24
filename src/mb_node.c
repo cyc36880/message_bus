@@ -380,6 +380,24 @@ mb_err_t mb_node_publish_async(mb_node_t *node,
                                          opts, timeout_ms);
 }
 
+mb_err_t mb_node_publish_async_wait(mb_node_t *node,
+                                    const char *topic,
+                                    const void *payload,
+                                    size_t payload_len,
+                                    const mb_publish_opts_t *opts,
+                                    uint32_t timeout_ms,
+                                    size_t *out_delivered)
+{
+    if (node == NULL || topic == NULL) {
+        if (out_delivered != NULL) {
+            *out_delivered = 0;
+        }
+        return MB_ERR_INVALID_ARG;
+    }
+    return mb_bus_publish_async_wait_internal(node->bus, node->name, topic, payload,
+                                              payload_len, opts, timeout_ms, out_delivered);
+}
+
 mb_err_t mb_node_publish_to_async(mb_node_t *node,
                                   const char *dst_node,
                                   const char *subtopic,
@@ -404,6 +422,82 @@ mb_err_t mb_node_publish_to_async(mb_node_t *node,
     }
     return mb_bus_publish_async_internal(node->bus, node->name, topic, payload, payload_len,
                                          opts, timeout_ms);
+}
+
+mb_err_t mb_node_publish_to_async_wait(mb_node_t *node,
+                                       const char *dst_node,
+                                       const char *subtopic,
+                                       const void *payload,
+                                       size_t payload_len,
+                                       const mb_publish_opts_t *opts,
+                                       uint32_t timeout_ms,
+                                       size_t *out_delivered)
+{
+    char topic[MB_CONFIG_MAX_TOPIC_LEN];
+    mb_err_t err;
+
+    if (out_delivered != NULL) {
+        *out_delivered = 0;
+    }
+    if (node == NULL || dst_node == NULL) {
+        return MB_ERR_INVALID_ARG;
+    }
+    if (validate_node_name(dst_node) != MB_OK) {
+        return MB_ERR_INVALID_ARG;
+    }
+
+    err = mb_topic_build(topic, sizeof(topic), dst_node, subtopic);
+    if (err != MB_OK) {
+        return err;
+    }
+    return mb_bus_publish_async_wait_internal(node->bus, node->name, topic, payload,
+                                              payload_len, opts, timeout_ms, out_delivered);
+}
+
+mb_err_t mb_node_publish_async_notify(mb_node_t *node,
+                                      const char *topic,
+                                      const void *payload,
+                                      size_t payload_len,
+                                      const mb_publish_opts_t *opts,
+                                      uint32_t timeout_ms,
+                                      mb_async_done_handler_t on_done,
+                                      void *user_data)
+{
+    if (node == NULL || topic == NULL) {
+        return MB_ERR_INVALID_ARG;
+    }
+    return mb_bus_publish_async_notify_internal(node->bus, node, node->name, topic,
+                                                payload, payload_len, opts, timeout_ms,
+                                                on_done, user_data);
+}
+
+mb_err_t mb_node_publish_to_async_notify(mb_node_t *node,
+                                         const char *dst_node,
+                                         const char *subtopic,
+                                         const void *payload,
+                                         size_t payload_len,
+                                         const mb_publish_opts_t *opts,
+                                         uint32_t timeout_ms,
+                                         mb_async_done_handler_t on_done,
+                                         void *user_data)
+{
+    char topic[MB_CONFIG_MAX_TOPIC_LEN];
+    mb_err_t err;
+
+    if (node == NULL || dst_node == NULL) {
+        return MB_ERR_INVALID_ARG;
+    }
+    if (validate_node_name(dst_node) != MB_OK) {
+        return MB_ERR_INVALID_ARG;
+    }
+
+    err = mb_topic_build(topic, sizeof(topic), dst_node, subtopic);
+    if (err != MB_OK) {
+        return err;
+    }
+    return mb_bus_publish_async_notify_internal(node->bus, node, node->name, topic,
+                                                payload, payload_len, opts, timeout_ms,
+                                                on_done, user_data);
 }
 
 /* -------------------------------------------------------------------------

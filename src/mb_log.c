@@ -89,6 +89,8 @@ const char *mb_err_to_string(mb_err_t err)
     case MB_ERR_UNSUPPORTED:    return "MB_ERR_UNSUPPORTED";
     case MB_ERR_TIMEOUT:        return "MB_ERR_TIMEOUT";
     case MB_ERR_WOULD_DEADLOCK: return "MB_ERR_WOULD_DEADLOCK";
+    case MB_ERR_DROPPED:        return "MB_ERR_DROPPED";
+    case MB_ERR_NO_SUBSCRIBER:  return "MB_ERR_NO_SUBSCRIBER";
     default:                    return "MB_ERR_UNKNOWN";
     }
 }

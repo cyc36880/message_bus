@@ -3,7 +3,9 @@ set(MB_EXAMPLES
     01_basic_pubsub
     02_wildcards_filter
     03_lvgl_motor_sensor
-    04_node_events)
+    04_node_events
+    05_async_await
+    06_async_notify_overlay)
 
 foreach(example IN LISTS MB_EXAMPLES)
     add_executable(example_${example} ${example}.c)

@@ -1149,6 +1149,1070 @@ MB_TEST(destroy_drains_queued_messages)
     MB_CHECK(true);
 }
 
+/* -------------------------------------------------------------------------
+ * 用例：异步发布 + 等待消费（await）
+ *
+ * 目标不是「消息能送到」，而是「await 返回时回调确实已经跑完」。
+ * 因此这几条用例的关键断言都落在**时序**与**线程归属**上：
+ *   - 发布方线程在 pump 把消息投递完之前一直不返回；
+ *   - 返回时回调次数、内容、执行线程都符合预期。
+ * ---------------------------------------------------------------------- */
+
+/** 轮询等待队列里至少出现 at_least 条消息（避免「主线程先 pump、发布方还没入队」）。 */
+static bool wait_until_pending(mb_bus_t *bus, size_t at_least, uint32_t timeout_ms)
+{
+    uint32_t start = mb_os_time_ms();
+
+    while (mb_bus_async_pending(bus) < at_least) {
+        if (mb_os_time_ms() - start > timeout_ms) {
+            return false;
+        }
+        mb_os_sleep_ms(1);
+    }
+    return true;
+}
+
+typedef struct {
+    mb_node_t *node;
+    const char *topic;
+    const char *payload;
+    uint32_t timeout_ms;
+    mb_err_t result;   /**< 初值用 MB_ERR_STATE 当「还没返回」的哨兵 */
+    size_t delivered;
+    uint32_t elapsed_ms;
+    unsigned long thread_id;
+} await_job_t;
+
+/** 与 log_cb 相同，额外记录回调跑在哪个线程上。 */
+static void log_cb_record_thread(mb_subscription_t *sub, const mb_message_t *msg,
+                                 void *user_data)
+{
+    g_cb_thread = current_thread_id();
+    log_cb(sub, msg, user_data);
+}
+
+static void await_publish_job(void *arg)
+{
+    await_job_t *job = (await_job_t *)arg;
+    uint32_t start = mb_os_time_ms();
+
+    job->thread_id = current_thread_id();
+    job->result = mb_node_publish_async_wait(job->node, job->topic, job->payload,
+                                             strlen(job->payload), NULL,
+                                             job->timeout_ms, &job->delivered);
+    job->elapsed_ms = mb_os_time_ms() - start;
+}
+
+MB_TEST(await_blocks_until_pump_delivers)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *pub = NULL;
+    mb_node_t *sink = NULL;
+    thread_t thread;
+    thread_job_t desc;
+    await_job_t job;
+    log_t log;
+
+    log_reset(&log);
+    MB_CHECK_INT(mb_bus_create("async18", &bus), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "sink", &sink), MB_OK);
+    MB_CHECK_INT(mb_node_subscribe(sink, "a/b", log_cb_record_thread, &log, NULL), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+
+    job.node = pub;
+    job.topic = "a/b";
+    job.payload = "hello";
+    job.timeout_ms = 5000;
+    job.result = MB_ERR_STATE;
+    job.delivered = 999;
+    job.elapsed_ms = 0;
+    job.thread_id = 0;
+    desc.fn = await_publish_job;
+    desc.arg = &job;
+    MB_CHECK(thread_start(&thread, &desc));
+
+    /* 消息确实已经入队，但还没有任何线程 pump 它 */
+    MB_CHECK(wait_until_pending(bus, 1, 2000));
+    mb_os_sleep_ms(30);
+    MB_CHECK_INT(job.result, MB_ERR_STATE); /* 仍在阻塞：字段还没被写 */
+    MB_CHECK_INT(log.count, 0);
+
+    g_cb_thread = 0;
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+    thread_join(&thread);
+
+    /* 关键：await 返回时回调已经执行完毕 */
+    MB_CHECK_INT(job.result, MB_OK);
+    MB_CHECK_INT(job.delivered, 1);
+    MB_CHECK(job.elapsed_ms >= 20);
+    MB_CHECK_INT(log.count, 1);
+    MB_CHECK_STR(log.payload[0], "hello");
+    MB_CHECK_STR(log.source[0], "pub");
+
+    /* 回调跑在 pump（主）线程上，而不是发布方线程上 */
+    MB_CHECK(g_cb_thread == current_thread_id());
+    MB_CHECK(g_cb_thread != job.thread_id);
+    MB_CHECK_INT(mb_bus_async_pending(bus), 0);
+
+    mb_bus_destroy(bus);
+}
+
+MB_TEST(await_waits_for_all_matching_subscribers)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *pub = NULL;
+    mb_node_t *sink_a = NULL;
+    mb_node_t *sink_b = NULL;
+    thread_t thread;
+    thread_job_t desc;
+    await_job_t job;
+    log_t log_a;
+    log_t log_b;
+
+    log_reset(&log_a);
+    log_reset(&log_b);
+
+    MB_CHECK_INT(mb_bus_create("async18c", &bus), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "sink_a", &sink_a), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "sink_b", &sink_b), MB_OK);
+    MB_CHECK_INT(mb_node_subscribe(sink_a, "multi/x", log_cb, &log_a, NULL), MB_OK);
+    MB_CHECK_INT(mb_node_subscribe(sink_b, "multi/x", log_cb, &log_b, NULL), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+
+    job.node = pub;
+    job.topic = "multi/x";
+    job.payload = "v";
+    job.timeout_ms = 5000;
+    job.result = MB_ERR_STATE;
+    job.delivered = 0;
+    desc.fn = await_publish_job;
+    desc.arg = &job;
+    MB_CHECK(thread_start(&thread, &desc));
+
+    MB_CHECK(wait_until_pending(bus, 1, 2000));
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+    thread_join(&thread);
+
+    /* 「消费」以整条消息为单位：返回时两个订阅者的回调都该跑完 */
+    MB_CHECK_INT(job.result, MB_OK);
+    MB_CHECK_INT(job.delivered, 2);
+    MB_CHECK_INT(log_a.count, 1);
+    MB_CHECK_INT(log_b.count, 1);
+
+    mb_bus_destroy(bus);
+}
+
+MB_TEST(await_forever_returns_after_delivery)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *pub = NULL;
+    mb_node_t *sink = NULL;
+    thread_t thread;
+    thread_job_t desc;
+    await_job_t job;
+    log_t log;
+
+    log_reset(&log);
+    bus = make_bus_with_sink("async18b", "a/b", &log, &sink);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+
+    job.node = pub;
+    job.topic = "a/b";
+    job.payload = "forever";
+    job.timeout_ms = MB_WAIT_FOREVER;
+    job.result = MB_ERR_STATE;
+    job.delivered = 999;
+    job.elapsed_ms = 0;
+    desc.fn = await_publish_job;
+    desc.arg = &job;
+    MB_CHECK(thread_start(&thread, &desc));
+
+    MB_CHECK(wait_until_pending(bus, 1, 2000));
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+    thread_join(&thread);
+
+    MB_CHECK_INT(job.result, MB_OK);
+    MB_CHECK_INT(job.delivered, 1);
+    MB_CHECK_INT(log.count, 1);
+    MB_CHECK_STR(log.payload[0], "forever");
+
+    mb_bus_destroy(bus);
+}
+
+MB_TEST(await_times_out_and_cancels_pending_message)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *pub = NULL;
+    mb_node_t *sink = NULL;
+    mb_bus_stats_t stats;
+    size_t delivered = 99;
+    uint32_t start;
+    log_t log;
+
+    log_reset(&log);
+    bus = make_bus_with_sink("async19", "t/x", &log, &sink);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+
+    /* 没有任何线程 pump：等满超时后应当撤销这条消息，而不是把它留在队列里
+     * 等着「迟到的投递」。 */
+    start = mb_os_time_ms();
+    MB_CHECK_INT(mb_node_publish_async_wait(pub, "t/x", "v", 1, NULL, 100, &delivered),
+                 MB_ERR_TIMEOUT);
+    MB_CHECK(mb_os_time_ms() - start >= 50);
+    MB_CHECK_INT(delivered, 0);
+    MB_CHECK_INT(log.count, 0);
+
+    MB_CHECK_INT(mb_bus_get_stats(bus, &stats), MB_OK);
+    MB_CHECK_INT(stats.async_enqueued, 1);
+    MB_CHECK_INT(stats.async_canceled, 1);
+    MB_CHECK_INT(stats.async_dropped, 0);
+
+    /* 撤销是**当场**完成的：消息不再占着主题空位，也不需要等 pump 来清 */
+    MB_CHECK_INT(mb_bus_async_pending(bus), 0);
+    MB_CHECK_INT(mb_bus_async_topic_count(bus), 0);
+
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+    MB_CHECK_INT(log.count, 0);
+    MB_CHECK_INT(mb_bus_async_pending(bus), 0);
+
+    mb_bus_destroy(bus);
+}
+
+MB_TEST(await_with_zero_timeout_is_plain_async_publish)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *pub = NULL;
+    mb_node_t *sink = NULL;
+    size_t delivered = 42;
+    log_t log;
+
+    log_reset(&log);
+    bus = make_bus_with_sink("async20", "z/x", &log, &sink);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+
+    /* MB_WAIT_NONE = 只入队，不等 —— 与普通异步发布完全一致 */
+    MB_CHECK_INT(mb_node_publish_async_wait(pub, "z/x", "v", 1, NULL, MB_WAIT_NONE,
+                                            &delivered),
+                 MB_OK);
+    MB_CHECK_INT(delivered, 0);
+    MB_CHECK_INT(log.count, 0);
+    MB_CHECK_INT(mb_bus_async_pending(bus), 1);
+
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+    MB_CHECK_INT(log.count, 1);
+
+    mb_bus_destroy(bus);
+}
+
+MB_TEST(await_completes_without_any_subscriber)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *pub = NULL;
+    thread_t thread;
+    thread_job_t desc;
+    await_job_t job;
+    mb_bus_stats_t stats;
+
+    MB_CHECK_INT(mb_bus_create("async21", &bus), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+
+    job.node = pub;
+    job.topic = "ghost/x";
+    job.payload = "nobody";
+    job.timeout_ms = 5000;
+    job.result = MB_ERR_STATE;
+    job.delivered = 999;
+    job.elapsed_ms = 0;
+    desc.fn = await_publish_job;
+    desc.arg = &job;
+    MB_CHECK(thread_start(&thread, &desc));
+
+    MB_CHECK(wait_until_pending(bus, 1, 2000));
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+    thread_join(&thread);
+
+    /* 「消费」的完整含义是 pump 处理完这条消息，而不是「必须有人订阅」 */
+    MB_CHECK_INT(job.result, MB_OK);
+    MB_CHECK_INT(job.delivered, 0);
+
+    MB_CHECK_INT(mb_bus_get_stats(bus, &stats), MB_OK);
+    /* no_subscriber = 创建节点时的上线事件 1 条 + 本次 ghost/x 1 条 */
+    MB_CHECK_INT(stats.no_subscriber, 2);
+
+    mb_bus_destroy(bus);
+}
+
+MB_TEST(await_to_variant_builds_target_topic)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *pub = NULL;
+    mb_node_t *sink = NULL;
+    thread_t thread;
+    thread_job_t desc;
+    await_job_t job;
+    log_t log;
+
+    log_reset(&log);
+    bus = make_bus_with_sink("async22", "sink/a", &log, &sink);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+
+    job.node = pub;
+    job.topic = "sink/a";
+    job.payload = "v";
+    job.timeout_ms = 5000;
+    job.result = MB_ERR_STATE;
+    job.delivered = 999;
+    desc.fn = await_publish_job;
+    desc.arg = &job;
+    MB_CHECK(thread_start(&thread, &desc));
+
+    MB_CHECK(wait_until_pending(bus, 1, 2000));
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+    thread_join(&thread);
+
+    MB_CHECK_INT(job.result, MB_OK);
+    MB_CHECK_INT(job.delivered, 1);
+    MB_CHECK_INT(log.count, 1);
+    MB_CHECK_STR(log.topic[0], "sink/a");
+
+    mb_bus_destroy(bus);
+}
+
+/* 双向握手：发布方每轮都等到「回调已经把值写进去」才读它。
+ * 若 await 提前返回，g_handshake_value 会落后于 i，mismatch 立刻增长。 */
+#define HANDSHAKE_ROUNDS 100
+
+static volatile int g_handshake_value;
+static volatile int g_handshake_delivered;
+static int g_handshake_finished;
+
+static void handshake_cb(mb_subscription_t *sub, const mb_message_t *msg, void *user_data)
+{
+    int value;
+
+    (void)sub;
+    (void)user_data;
+    memcpy(&value, msg->payload, sizeof(value));
+    __atomic_add_fetch(&g_handshake_delivered, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_handshake_value, value, __ATOMIC_SEQ_CST);
+}
+
+typedef struct {
+    mb_node_t *node;
+    int rounds;
+    mb_err_t result;
+    int mismatches;
+} handshake_job_t;
+
+static void handshake_publish_job(void *arg)
+{
+    handshake_job_t *job = (handshake_job_t *)arg;
+    int i;
+
+    job->result = MB_OK;
+    job->mismatches = 0;
+
+    for (i = 0; i < job->rounds; ++i) {
+        size_t delivered = 0;
+        mb_err_t err = mb_node_publish_async_wait(job->node, "hs/set", &i, sizeof(i),
+                                                  NULL, 5000, &delivered);
+
+        if (err != MB_OK || delivered != 1) {
+            job->result = err;
+            break;
+        }
+        /* await 已经保证回调返回；这里读到的必须是本轮写入的值 */
+        if (__atomic_load_n(&g_handshake_value, __ATOMIC_SEQ_CST) != i) {
+            job->mismatches++;
+        }
+    }
+
+    __atomic_store_n(&g_handshake_finished, 1, __ATOMIC_SEQ_CST);
+}
+
+MB_TEST(await_handshakes_two_threads_round_by_round)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *sink = NULL;
+    mb_node_t *pub = NULL;
+    thread_t thread;
+    thread_job_t desc;
+    handshake_job_t job;
+
+    MB_CHECK_INT(mb_bus_create("async23", &bus), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "sink", &sink), MB_OK);
+    MB_CHECK_INT(mb_node_subscribe(sink, "hs/set", handshake_cb, NULL, NULL), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+
+    __atomic_store_n(&g_handshake_value, -1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_handshake_delivered, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_handshake_finished, 0, __ATOMIC_SEQ_CST);
+
+    job.node = pub;
+    job.rounds = HANDSHAKE_ROUNDS;
+    job.result = MB_ERR_STATE;
+    job.mismatches = -1;
+    desc.fn = handshake_publish_job;
+    desc.arg = &job;
+    MB_CHECK(thread_start(&thread, &desc));
+
+    for (;;) {
+        mb_bus_pump(bus);
+
+        if (__atomic_load_n(&g_handshake_finished, __ATOMIC_SEQ_CST)) {
+            mb_bus_pump(bus); /* 把最后一轮可能残留的队列收干净 */
+            break;
+        }
+        mb_os_sleep_ms(1);
+    }
+    thread_join(&thread);
+
+    MB_CHECK_INT(job.result, MB_OK);
+    MB_CHECK_INT(job.mismatches, 0);
+    MB_CHECK_INT(__atomic_load_n(&g_handshake_delivered, __ATOMIC_SEQ_CST),
+                 HANDSHAKE_ROUNDS);
+    MB_CHECK_INT(__atomic_load_n(&g_handshake_value, __ATOMIC_SEQ_CST),
+                 HANDSHAKE_ROUNDS - 1);
+    MB_CHECK_INT(mb_bus_async_pending(bus), 0);
+
+    mb_bus_destroy(bus);
+}
+
+/* -------------------------------------------------------------------------
+ * 用例：多生产者并发 await（回执生命周期与引用计数的压力测试）
+ * ---------------------------------------------------------------------- */
+
+#define AWAIT_STRESS_THREADS 4
+#define AWAIT_STRESS_ROUNDS 50
+
+static volatile int g_await_stress_delivered;
+static volatile int g_await_stress_done;
+
+static void await_stress_cb(mb_subscription_t *sub, const mb_message_t *msg, void *user_data)
+{
+    (void)sub;
+    (void)msg;
+    (void)user_data;
+    __atomic_add_fetch(&g_await_stress_delivered, 1, __ATOMIC_SEQ_CST);
+}
+
+typedef struct {
+    mb_node_t *node;
+    int index;
+    int ok;
+    int failed;
+} await_stress_arg_t;
+
+static void await_stress_job(void *arg)
+{
+    await_stress_arg_t *job = (await_stress_arg_t *)arg;
+    char topic[32];
+    int i;
+
+    snprintf(topic, sizeof(topic), "stress/%d", job->index);
+    for (i = 0; i < AWAIT_STRESS_ROUNDS; ++i) {
+        size_t delivered = 0;
+        mb_err_t err = mb_node_publish_async_wait(job->node, topic, &i, sizeof(i),
+                                                  NULL, 5000, &delivered);
+
+        if (err == MB_OK && delivered == 1) {
+            job->ok++;
+        } else {
+            job->failed++;
+        }
+    }
+    __atomic_add_fetch(&g_await_stress_done, 1, __ATOMIC_SEQ_CST);
+}
+
+MB_TEST(await_handles_concurrent_producers)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *sink = NULL;
+    mb_node_t *pubs[AWAIT_STRESS_THREADS] = { NULL };
+    await_stress_arg_t args[AWAIT_STRESS_THREADS];
+    thread_t threads[AWAIT_STRESS_THREADS];
+    thread_job_t descs[AWAIT_STRESS_THREADS];
+    char name[16];
+    int i;
+    int ok = 0;
+    int failed = 0;
+
+    MB_CHECK_INT(mb_bus_create("async23b", &bus), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "sink", &sink), MB_OK);
+    MB_CHECK_INT(mb_node_subscribe(sink, "stress/#", await_stress_cb, NULL, NULL), MB_OK);
+
+    __atomic_store_n(&g_await_stress_delivered, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_await_stress_done, 0, __ATOMIC_SEQ_CST);
+
+    for (i = 0; i < AWAIT_STRESS_THREADS; ++i) {
+        snprintf(name, sizeof(name), "stresspub%d", i);
+        MB_CHECK_INT(mb_node_create(bus, name, &pubs[i]), MB_OK);
+        args[i].node = pubs[i];
+        args[i].index = i;
+        args[i].ok = 0;
+        args[i].failed = 0;
+        descs[i].fn = await_stress_job;
+        descs[i].arg = &args[i];
+        MB_CHECK(thread_start(&threads[i], &descs[i]));
+    }
+
+    /* 主线程是唯一 pump：生产者的 await 全都靠它推进 */
+    for (;;) {
+        mb_bus_pump(bus);
+
+        if (__atomic_load_n(&g_await_stress_done, __ATOMIC_SEQ_CST) ==
+                AWAIT_STRESS_THREADS &&
+            mb_bus_async_pending(bus) == 0) {
+            break;
+        }
+        mb_os_sleep_ms(1);
+    }
+
+    for (i = 0; i < AWAIT_STRESS_THREADS; ++i) {
+        thread_join(&threads[i]);
+        ok += args[i].ok;
+        failed += args[i].failed;
+    }
+
+    MB_CHECK_INT(ok, AWAIT_STRESS_THREADS * AWAIT_STRESS_ROUNDS);
+    MB_CHECK_INT(failed, 0);
+    MB_CHECK_INT(__atomic_load_n(&g_await_stress_delivered, __ATOMIC_SEQ_CST),
+                 AWAIT_STRESS_THREADS * AWAIT_STRESS_ROUNDS);
+    MB_CHECK_INT(mb_bus_async_pending(bus), 0);
+    MB_CHECK_INT(mb_bus_async_topic_count(bus), 0);
+
+    mb_bus_destroy(bus);
+}
+
+/* -------------------------------------------------------------------------
+ * 用例：pump 回调里等待消费必然失败
+ * ---------------------------------------------------------------------- */
+
+static mb_node_t *g_await_pub;
+static mb_err_t g_await_from_cb_finite;
+static mb_err_t g_await_from_cb_forever;
+static mb_err_t g_await_from_cb_none;
+
+static void await_from_callback_cb(mb_subscription_t *sub, const mb_message_t *msg,
+                                   void *user_data)
+{
+    size_t delivered = 0;
+
+    (void)sub;
+    (void)msg;
+    (void)user_data;
+
+    g_await_from_cb_finite =
+        mb_node_publish_async_wait(g_await_pub, "wc/finite", "x", 1, NULL, 10, &delivered);
+    g_await_from_cb_forever =
+        mb_node_publish_async_wait(g_await_pub, "wc/forever", "x", 1, NULL,
+                                   MB_WAIT_FOREVER, &delivered);
+    g_await_from_cb_none =
+        mb_node_publish_async_wait(g_await_pub, "wc/none", "x", 1, NULL, MB_WAIT_NONE,
+                                   &delivered);
+}
+
+MB_TEST(await_from_pump_callback_is_rejected)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *pub = NULL;
+    mb_node_t *sink = NULL;
+    mb_bus_stats_t stats;
+
+    MB_CHECK_INT(mb_bus_create("async24", &bus), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "sink", &sink), MB_OK);
+    MB_CHECK_INT(mb_node_subscribe(sink, "wc/trigger", await_from_callback_cb, NULL, NULL),
+                 MB_OK);
+
+    g_await_pub = pub;
+    g_await_from_cb_finite = MB_OK;
+    g_await_from_cb_forever = MB_OK;
+    g_await_from_cb_none = MB_OK;
+
+    MB_CHECK_INT(mb_node_publish_async(pub, "wc/trigger", "x", 1, NULL, MB_WAIT_NONE),
+                 MB_OK);
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+
+    /* 有限超时和无限等待都不可能成功：消费这条消息的 pump 正卡在回调里。
+     * 库直接拒绝，而不是让发布方白等一个超时周期。 */
+    MB_CHECK_INT(g_await_from_cb_finite, MB_ERR_WOULD_DEADLOCK);
+    MB_CHECK_INT(g_await_from_cb_forever, MB_ERR_WOULD_DEADLOCK);
+
+    /* MB_WAIT_NONE 只是入队，不受限制 */
+    MB_CHECK_INT(g_await_from_cb_none, MB_OK);
+
+    MB_CHECK_INT(mb_bus_get_stats(bus, &stats), MB_OK);
+    /* published = 2 条节点上线事件 + trigger + wc/none */
+    MB_CHECK_INT(stats.published, 4);
+    MB_CHECK_INT(stats.async_enqueued, 2);
+    MB_CHECK_INT(stats.async_canceled, 0);
+    MB_CHECK_INT(stats.async_dropped, 0);
+
+    /* 拒绝不能把 pump 标记弄脏：之后仍可正常 pump */
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+
+    mb_bus_destroy(bus);
+}
+
+/* -------------------------------------------------------------------------
+ * 用例：await 的覆盖相关行为
+ * ---------------------------------------------------------------------- */
+
+MB_TEST(await_rejects_explicit_overwrite_flag)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *pub = NULL;
+    mb_publish_opts_t opts;
+    size_t delivered = 7;
+
+    MB_CHECK_INT(mb_bus_create("async25", &bus), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+
+    opts.flags = MB_PUB_FLAG_ASYNC_OVERWRITE;
+    opts.qos = 0;
+    MB_CHECK_INT(mb_node_publish_async_wait(pub, "ow/x", "v", 1, &opts, 100, &delivered),
+                 MB_ERR_INVALID_ARG);
+    MB_CHECK_INT(delivered, 0);
+    MB_CHECK_INT(mb_bus_async_pending(bus), 0);
+
+    mb_bus_destroy(bus);
+}
+
+#if MB_CONFIG_ASYNC_OVERWRITE_OLDEST == 0
+MB_TEST(await_reports_drop_when_overwritten_by_another_publisher)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *pub = NULL;
+    mb_node_t *sink = NULL;
+    thread_t thread;
+    thread_job_t desc;
+    await_job_t job;
+    mb_publish_opts_t opts;
+    mb_bus_stats_t stats;
+    int i;
+    log_t log;
+
+    log_reset(&log);
+    bus = make_bus_with_sink("async26", "ov/a", &log, &sink);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+
+    job.node = pub;
+    job.topic = "ov/a";
+    job.payload = "victim";
+    job.timeout_ms = 5000;
+    job.result = MB_ERR_STATE;
+    job.delivered = 99;
+    desc.fn = await_publish_job;
+    desc.arg = &job;
+    MB_CHECK(thread_start(&thread, &desc));
+
+    MB_CHECK(wait_until_pending(bus, 1, 2000));
+
+    /* 把该主题剩余的队列位置填满（await 消息是最旧的一条），
+     * 再用覆盖策略发一条 —— 被顶掉的恰好是正在等待的那条。 */
+    for (i = 0; i < MB_CONFIG_ASYNC_QUEUE_DEPTH - 1; ++i) {
+        MB_CHECK_INT(mb_node_publish_async(pub, "ov/a", "fill", 4, NULL, MB_WAIT_NONE),
+                     MB_OK);
+    }
+    opts.flags = MB_PUB_FLAG_ASYNC_OVERWRITE;
+    opts.qos = 0;
+    MB_CHECK_INT(mb_node_publish_async(pub, "ov/a", "new", 3, &opts, MB_WAIT_NONE), MB_OK);
+
+    thread_join(&thread);
+
+    /* 不能假装「消费成功」，也不能让发布方白等到 5 秒超时 */
+    MB_CHECK_INT(job.result, MB_ERR_DROPPED);
+    MB_CHECK_INT(job.delivered, 0);
+    MB_CHECK(job.elapsed_ms < 2000);
+
+    MB_CHECK_INT(mb_bus_get_stats(bus, &stats), MB_OK);
+    MB_CHECK_INT(stats.async_overwritten, 1);
+    MB_CHECK_INT(stats.async_canceled, 0);
+
+    /* 剩下的是 D-1 条 fill + 1 条 new */
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+    MB_CHECK_INT(log.count, MB_CONFIG_ASYNC_QUEUE_DEPTH);
+
+    mb_bus_destroy(bus);
+}
+
+MB_TEST(await_full_queue_honours_timeout)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *pub = NULL;
+    mb_node_t *sink = NULL;
+    mb_bus_stats_t stats;
+    size_t delivered = 9;
+    uint32_t start;
+    int i;
+    log_t log;
+
+    log_reset(&log);
+    bus = make_bus_with_sink("async27", "qf/a", &log, &sink);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+
+    for (i = 0; i < MB_CONFIG_ASYNC_QUEUE_DEPTH; ++i) {
+        MB_CHECK_INT(mb_node_publish_async(pub, "qf/a", "x", 1, NULL, MB_WAIT_NONE), MB_OK);
+    }
+
+    /* 队列满：总超时预算先花在等空位上，等不到就丢弃，连回执都不该留下 */
+    start = mb_os_time_ms();
+    MB_CHECK_INT(mb_node_publish_async_wait(pub, "qf/a", "late", 4, NULL, 100, &delivered),
+                 MB_ERR_TIMEOUT);
+    MB_CHECK(mb_os_time_ms() - start >= 50);
+    MB_CHECK_INT(delivered, 0);
+    MB_CHECK_INT(mb_bus_async_pending(bus), MB_CONFIG_ASYNC_QUEUE_DEPTH);
+
+    MB_CHECK_INT(mb_bus_get_stats(bus, &stats), MB_OK);
+    MB_CHECK_INT(stats.async_dropped, 1);
+    MB_CHECK_INT(stats.async_canceled, 0);
+
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+    MB_CHECK_INT(log.count, MB_CONFIG_ASYNC_QUEUE_DEPTH);
+
+    mb_bus_destroy(bus);
+}
+#endif /* MB_CONFIG_ASYNC_OVERWRITE_OLDEST == 0 */
+
+/* -------------------------------------------------------------------------
+ * 用例：非阻塞推送 + 完成回调（notify）
+ *
+ * 与 await 的关键区别：推送函数返回时**回调一定还没跑**，而且推送耗时
+ * 不随队列/超时增长；结果由 mb_bus_pump() 在 pump 线程上回调。
+ * ---------------------------------------------------------------------- */
+
+#define NOTIFY_MAX_CALLS 4
+
+typedef struct {
+    int calls;
+    bool success[NOTIFY_MAX_CALLS];
+    mb_err_t status[NOTIFY_MAX_CALLS];
+    size_t delivered[NOTIFY_MAX_CALLS];
+    uint32_t elapsed_since_publish[NOTIFY_MAX_CALLS];
+    uint32_t requested_timeout_ms[NOTIFY_MAX_CALLS];
+    char topic[NOTIFY_MAX_CALLS][48];
+    char payload[NOTIFY_MAX_CALLS][32];
+    const mb_node_t *node[NOTIFY_MAX_CALLS];
+    const mb_bus_t *bus[NOTIFY_MAX_CALLS];
+    unsigned long thread;
+} notify_log_t;
+
+static void notify_record_cb(const mb_async_result_t *result, void *user_data)
+{
+    notify_log_t *log = (notify_log_t *)user_data;
+    int i = log->calls;
+    size_t n;
+
+    log->thread = current_thread_id();
+    if (i < NOTIFY_MAX_CALLS) {
+        log->success[i] = result->success;
+        log->status[i] = result->status;
+        log->delivered[i] = result->delivered;
+        log->elapsed_since_publish[i] = result->elapsed_since_publish_ms;
+        log->requested_timeout_ms[i] = result->requested_timeout_ms;
+        log->node[i] = result->node;
+        log->bus[i] = result->bus;
+        snprintf(log->topic[i], sizeof(log->topic[i]), "%s",
+                 (result->topic != NULL) ? result->topic : "");
+
+        n = result->payload_len;
+        if (n >= sizeof(log->payload[i])) {
+            n = sizeof(log->payload[i]) - 1;
+        }
+        if (n > 0 && result->payload != NULL) {
+            memcpy(log->payload[i], result->payload, n);
+        }
+        log->payload[i][n] = '\0';
+    }
+    log->calls++;
+}
+
+MB_TEST(notify_reports_success_from_pump_thread)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *pub = NULL;
+    mb_node_t *sink = NULL;
+    notify_log_t log;
+    uint32_t start;
+    uint32_t publish_ms;
+
+    memset(&log, 0, sizeof(log));
+
+    MB_CHECK_INT(mb_bus_create("notify1", &bus), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "sink", &sink), MB_OK);
+    MB_CHECK_INT(mb_node_subscribe(sink, "n/x", count_atomic_cb, NULL, NULL), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+    g_async_delivered = 0;
+
+    start = mb_os_time_ms();
+    MB_CHECK_INT(mb_node_publish_async_notify(pub, "n/x", "hello", 5, NULL, 1000,
+                                              notify_record_cb, &log),
+                 MB_OK);
+    publish_ms = mb_os_time_ms() - start;
+
+    /* 立即返回，回调一次都还没跑 */
+    MB_CHECK(publish_ms < 100);
+    MB_CHECK_INT(log.calls, 0);
+
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+
+    MB_CHECK_INT(log.calls, 1);
+    MB_CHECK(log.success[0]);
+    MB_CHECK_INT(log.status[0], MB_OK);
+    MB_CHECK_INT(log.delivered[0], 1);
+    MB_CHECK_INT(log.requested_timeout_ms[0], 1000);
+    MB_CHECK_STR(log.topic[0], "n/x");
+    MB_CHECK_STR(log.payload[0], "hello");
+    MB_CHECK(log.node[0] == pub);
+    MB_CHECK(log.bus[0] == bus);
+    MB_CHECK(log.thread == current_thread_id()); /* 回调在 pump 线程上 */
+    MB_CHECK_INT(g_async_delivered, 1);
+
+    /* 总线级版本：没有发布者节点，result->node 为 NULL */
+    MB_CHECK_INT(mb_bus_publish_async_notify(bus, "n/x", "busmsg", 6, NULL, 1000,
+                                             notify_record_cb, &log),
+                 MB_OK);
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+    MB_CHECK_INT(log.calls, 2);
+    MB_CHECK(log.success[1]);
+    MB_CHECK_INT(log.status[1], MB_OK);
+    MB_CHECK_INT(log.delivered[1], 1);
+    MB_CHECK(log.node[1] == NULL);
+    MB_CHECK_STR(log.payload[1], "busmsg");
+    MB_CHECK_INT(g_async_delivered, 2);
+
+    mb_bus_destroy(bus);
+}
+
+MB_TEST(notify_timeout_fires_on_next_pump)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *pub = NULL;
+    mb_bus_stats_t stats;
+    notify_log_t log;
+
+    memset(&log, 0, sizeof(log));
+    MB_CHECK_INT(mb_bus_create("notify2", &bus), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+
+    MB_CHECK_INT(mb_node_publish_async_notify(pub, "ghost/x", "boom", 4, NULL, 60,
+                                              notify_record_cb, &log),
+                 MB_OK);
+    MB_CHECK_INT(log.calls, 0);
+
+    /* 没有任何线程 pump：超时不会自己响 —— 必须由下一次 pump 触发 */
+    mb_os_sleep_ms(120);
+    MB_CHECK_INT(log.calls, 0);
+    MB_CHECK_INT(mb_bus_async_pending(bus), 1);
+
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+    MB_CHECK_INT(log.calls, 1);
+    MB_CHECK(!log.success[0]);
+    MB_CHECK_INT(log.status[0], MB_ERR_TIMEOUT);
+    MB_CHECK_INT(log.delivered[0], 0);
+    MB_CHECK(log.elapsed_since_publish[0] >= 60);
+    MB_CHECK_STR(log.topic[0], "ghost/x");
+    MB_CHECK_STR(log.payload[0], "boom");
+    MB_CHECK(log.node[0] == pub);
+
+    /* 超时后消息已被摘除，不会在之后迟到投递 */
+    MB_CHECK_INT(mb_bus_async_pending(bus), 0);
+    MB_CHECK_INT(mb_bus_async_topic_count(bus), 0);
+    MB_CHECK_INT(mb_bus_get_stats(bus, &stats), MB_OK);
+    MB_CHECK_INT(stats.async_canceled, 1);
+
+    mb_bus_destroy(bus);
+}
+
+typedef struct {
+    notify_log_t log;
+    int retries;
+    mb_err_t retry_err;
+    bool retried;
+} notify_retry_ctx_t;
+
+static void notify_retry_cb(const mb_async_result_t *result, void *user_data)
+{
+    notify_retry_ctx_t *ctx = (notify_retry_ctx_t *)user_data;
+
+    notify_record_cb(result, &ctx->log);
+
+    if (!ctx->retried && result->status == MB_ERR_TIMEOUT) {
+        ctx->retried = true;
+        ctx->retries++;
+
+        /* 用回调拿到的原始信息直接重试 —— 这正是失败回调存在的意义 */
+        ctx->retry_err = mb_node_publish_async_notify(result->node, result->topic,
+                                                      result->payload, result->payload_len,
+                                                      &result->opts, 1000,
+                                                      notify_retry_cb, ctx);
+    }
+}
+
+MB_TEST(notify_no_subscriber_is_reported_immediately)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *pub = NULL;
+    notify_log_t log;
+
+    memset(&log, 0, sizeof(log));
+    MB_CHECK_INT(mb_bus_create("notify2b", &bus), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+
+    MB_CHECK_INT(mb_node_publish_async_notify(pub, "nobody/x", "v", 1, NULL, 1000,
+                                              notify_record_cb, &log),
+                 MB_OK);
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+
+    /* 有 pump、但没人订阅：这是「已处理但没消费」，不是超时 */
+    MB_CHECK_INT(log.calls, 1);
+    MB_CHECK(!log.success[0]);
+    MB_CHECK_INT(log.status[0], MB_ERR_NO_SUBSCRIBER);
+    MB_CHECK_INT(log.delivered[0], 0);
+    MB_CHECK_INT(log.requested_timeout_ms[0], 1000);
+    MB_CHECK(log.elapsed_since_publish[0] < 1000);
+    MB_CHECK_INT(mb_bus_async_pending(bus), 0);
+
+    mb_bus_destroy(bus);
+}
+
+MB_TEST(notify_retry_from_callback_succeeds)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *pub = NULL;
+    mb_node_t *sink = NULL;
+    notify_retry_ctx_t ctx;
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.retry_err = MB_ERR_STATE;
+
+    MB_CHECK_INT(mb_bus_create("notify3", &bus), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "sink", &sink), MB_OK);
+    MB_CHECK_INT(mb_node_subscribe(sink, "retry/x", count_atomic_cb, NULL, NULL), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+    g_async_delivered = 0;
+
+    MB_CHECK_INT(mb_node_publish_async_notify(pub, "retry/x", "cmd", 3, NULL, 60,
+                                              notify_retry_cb, &ctx),
+                 MB_OK);
+    MB_CHECK_INT(ctx.log.calls, 0);
+
+    /* 故意拖过超时：第一次回调应当是 TIMEOUT，并在里面重试 */
+    mb_os_sleep_ms(120);
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+
+    MB_CHECK_INT(ctx.retries, 1);
+    MB_CHECK_INT(ctx.retry_err, MB_OK);
+    MB_CHECK(ctx.retried);
+    MB_CHECK_INT(ctx.log.calls, 2);
+
+    MB_CHECK(!ctx.log.success[0]);
+    MB_CHECK_INT(ctx.log.status[0], MB_ERR_TIMEOUT);
+    MB_CHECK_INT(ctx.log.delivered[0], 0);
+
+    /* 第二次：重试的消息被 sink 消化，回调报告成功 */
+    MB_CHECK(ctx.log.success[1]);
+    MB_CHECK_INT(ctx.log.status[1], MB_OK);
+    MB_CHECK_INT(ctx.log.delivered[1], 1);
+    MB_CHECK_STR(ctx.log.topic[1], "retry/x");
+    MB_CHECK_STR(ctx.log.payload[1], "cmd");
+    MB_CHECK_INT(g_async_delivered, 1);
+
+    MB_CHECK_INT(mb_bus_async_pending(bus), 0);
+    MB_CHECK_INT(mb_bus_async_topic_count(bus), 0);
+
+    mb_bus_destroy(bus);
+}
+
+#if MB_CONFIG_ASYNC_OVERWRITE_OLDEST == 0
+MB_TEST(notify_enqueue_failure_reports_via_callback)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *pub = NULL;
+    mb_node_t *sink = NULL;
+    mb_bus_stats_t stats;
+    notify_log_t log;
+    uint32_t start;
+    uint32_t publish_ms;
+    int i;
+
+    memset(&log, 0, sizeof(log));
+    MB_CHECK_INT(mb_bus_create("notify4", &bus), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "sink", &sink), MB_OK);
+    MB_CHECK_INT(mb_node_subscribe(sink, "full/x", count_atomic_cb, NULL, NULL), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+    g_async_delivered = 0;
+
+    for (i = 0; i < MB_CONFIG_ASYNC_QUEUE_DEPTH; ++i) {
+        MB_CHECK_INT(mb_node_publish_async(pub, "full/x", "x", 1, NULL, MB_WAIT_NONE), MB_OK);
+    }
+
+    /* 队列满：通知推送仍然必须立刻返回，失败由下一个 pump 回调报告 */
+    start = mb_os_time_ms();
+    MB_CHECK_INT(mb_node_publish_async_notify(pub, "full/x", "cmd", 3, NULL, 500,
+                                              notify_record_cb, &log),
+                 MB_OK);
+    publish_ms = mb_os_time_ms() - start;
+    MB_CHECK(publish_ms < 100);
+    MB_CHECK_INT(log.calls, 0);
+
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+
+    MB_CHECK_INT(log.calls, 1);
+    MB_CHECK(!log.success[0]);
+    MB_CHECK_INT(log.status[0], MB_ERR_TIMEOUT);
+    MB_CHECK_INT(log.delivered[0], 0);
+    MB_CHECK_STR(log.topic[0], "full/x");
+    MB_CHECK_STR(log.payload[0], "cmd");
+
+    /* 被拒绝的只是通知那条；队列里原有的消息照常投递 */
+    MB_CHECK_INT(g_async_delivered, MB_CONFIG_ASYNC_QUEUE_DEPTH);
+    MB_CHECK_INT(mb_bus_get_stats(bus, &stats), MB_OK);
+    MB_CHECK(stats.async_dropped >= 1);
+
+    mb_bus_destroy(bus);
+}
+#endif /* MB_CONFIG_ASYNC_OVERWRITE_OLDEST == 0 */
+
+MB_TEST(notify_argument_validation)
+{
+    mb_bus_t *bus = NULL;
+    mb_node_t *pub = NULL;
+    notify_log_t log;
+    mb_publish_opts_t opts;
+
+    memset(&log, 0, sizeof(log));
+    MB_CHECK_INT(mb_bus_create("notify5", &bus), MB_OK);
+    MB_CHECK_INT(mb_node_create(bus, "pub", &pub), MB_OK);
+
+    MB_CHECK_INT(mb_node_publish_async_notify(NULL, "a/b", "x", 1, NULL, 100,
+                                              notify_record_cb, &log),
+                 MB_ERR_INVALID_ARG);
+    MB_CHECK_INT(mb_node_publish_async_notify(pub, NULL, "x", 1, NULL, 100,
+                                              notify_record_cb, &log),
+                 MB_ERR_INVALID_ARG);
+    MB_CHECK_INT(mb_node_publish_async_notify(pub, "a/b", "x", 1, NULL, 100, NULL, &log),
+                 MB_ERR_INVALID_ARG);
+    MB_CHECK_INT(mb_bus_publish_async_notify(NULL, "a/b", "x", 1, NULL, 100,
+                                             notify_record_cb, &log),
+                 MB_ERR_INVALID_ARG);
+
+    opts.flags = MB_PUB_FLAG_ASYNC_OVERWRITE;
+    opts.qos = 0;
+    MB_CHECK_INT(mb_node_publish_async_notify(pub, "a/b", "x", 1, &opts, 100,
+                                              notify_record_cb, &log),
+                 MB_ERR_INVALID_ARG);
+
+    /* 全部被拒，队列里什么都没有，也不会留下待回调通知 */
+    MB_CHECK_INT(mb_bus_async_pending(bus), 0);
+    MB_CHECK_INT(log.calls, 0);
+    MB_CHECK_INT(mb_bus_pump(bus), MB_OK);
+    MB_CHECK_INT(log.calls, 0);
+
+    mb_bus_destroy(bus);
+}
+
 static const mb_test_case_t cases[] = {
     MB_CASE(delivery_waits_for_pump),
     MB_CASE(callback_runs_on_the_pump_thread),
@@ -1171,6 +2235,29 @@ static const mb_test_case_t cases[] = {
     MB_CASE(concurrent_producers_single_pump),
     MB_CASE(mixed_modes_share_a_topic_without_corrupting_the_ledger),
     MB_CASE(destroy_drains_queued_messages),
+    MB_CASE(await_blocks_until_pump_delivers),
+    MB_CASE(await_waits_for_all_matching_subscribers),
+    MB_CASE(await_forever_returns_after_delivery),
+    MB_CASE(await_times_out_and_cancels_pending_message),
+    MB_CASE(await_with_zero_timeout_is_plain_async_publish),
+    MB_CASE(await_completes_without_any_subscriber),
+    MB_CASE(await_to_variant_builds_target_topic),
+    MB_CASE(await_handshakes_two_threads_round_by_round),
+    MB_CASE(await_handles_concurrent_producers),
+    MB_CASE(await_from_pump_callback_is_rejected),
+    MB_CASE(await_rejects_explicit_overwrite_flag),
+#if MB_CONFIG_ASYNC_OVERWRITE_OLDEST == 0
+    MB_CASE(await_reports_drop_when_overwritten_by_another_publisher),
+    MB_CASE(await_full_queue_honours_timeout),
+#endif
+    MB_CASE(notify_reports_success_from_pump_thread),
+    MB_CASE(notify_timeout_fires_on_next_pump),
+    MB_CASE(notify_no_subscriber_is_reported_immediately),
+    MB_CASE(notify_retry_from_callback_succeeds),
+#if MB_CONFIG_ASYNC_OVERWRITE_OLDEST == 0
+    MB_CASE(notify_enqueue_failure_reports_via_callback),
+#endif
+    MB_CASE(notify_argument_validation),
 };
 
 #endif /* MB_CONFIG_ASYNC_MAX_TOPICS > 0 */

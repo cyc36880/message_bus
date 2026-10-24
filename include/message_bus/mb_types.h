@@ -40,8 +40,10 @@ typedef enum mb_err {
     MB_ERR_STATE = -7,         /**< 对象状态不允许该操作（如总线正在销毁） */
     MB_ERR_TOO_LONG = -8,      /**< 字符串或数据超过配置上限 */
     MB_ERR_UNSUPPORTED = -9,   /**< 当前平台/配置不支持该功能 */
-    MB_ERR_TIMEOUT = -10,      /**< 等待超时（异步发布的队列满且等不到空位） */
+    MB_ERR_TIMEOUT = -10,      /**< 等待超时（异步发布等队列空位，或 await 等消费） */
     MB_ERR_WOULD_DEADLOCK = -11, /**< 这次调用会永久卡死，已被拒绝；见 mb_node_publish_async */
+    MB_ERR_DROPPED = -12,      /**< 消息在等待投递期间被丢弃（如被覆盖策略顶掉） */
+    MB_ERR_NO_SUBSCRIBER = -13,/**< 消息已处理，但没有任何订阅者消费它（异步通知专用） */
 } mb_err_t;
 
 /** @return 错误码对应的英文短名，如 "MB_ERR_NOT_FOUND"。 */
@@ -118,6 +120,9 @@ typedef void (*mb_handler_t)(mb_subscription_t *sub, const mb_message_t *msg, vo
  * 覆盖 MB_CONFIG_ASYNC_OVERWRITE_OLDEST 的默认值。
  *
  * 同步发布忽略本标志。
+ * 等待模式下的 `*_async_wait()`（timeout_ms != MB_WAIT_NONE）不能与本标志
+ * 同用（那条路径要求「这条消息一定被消化」，与「允许被顶掉」互相矛盾），
+ * 会返回 MB_ERR_INVALID_ARG。
  */
 #define MB_PUB_FLAG_ASYNC_OVERWRITE (1u << 2)
 
@@ -125,6 +130,59 @@ typedef struct mb_publish_opts {
     uint8_t flags; /**< MB_PUB_FLAG_* 组合，可为 0 */
     uint8_t qos;   /**< 预留：MQTT QoS。当前仅支持 0（至多一次） */
 } mb_publish_opts_t;
+
+/* -------------------------------------------------------------------------
+ * 异步推送完成回调（mb_*_publish_async_notify 系列）
+ *
+ * 回调由 mb_bus_pump() 在 **pump 线程**上调用，不在发布者的线程上，
+ * 因此可以直接操作只允许 pump 线程访问的东西（例如 LVGL 控件）。
+ * 回调期间结构里的指针都有效；回调返回后全部失效。
+ * ---------------------------------------------------------------------- */
+
+typedef struct mb_async_result mb_async_result_t;
+
+/**
+ * 完成回调原型。
+ *
+ * @param result    本次推送的结果与原始请求信息，仅在回调期间有效。
+ * @param user_data 注册时传入的指针。
+ */
+typedef void (*mb_async_done_handler_t)(const mb_async_result_t *result, void *user_data);
+
+/**
+ * 一次「异步推送 + 完成通知」的结果。
+ *
+ * 成功与失败都会回调；用 @ref success 判断，而不是只看 status：
+ * 消息可能被 pump 处理了，但当时**没有任何订阅者命中**（`delivered == 0`），
+ * 这在本结构里不算成功（status 仍为 MB_OK）。
+ *
+ * 失败时可以把 topic / payload / opts / timeout_ms 原样再传给推送函数重试；
+ * node / bus 也一并给出。注意 node 只在回调期间有效（库为回调持有引用）。
+ */
+struct mb_async_result {
+    bool success;               /**< true = 至少投递给一个订阅者且没有错误 */
+    mb_err_t status;            /**< MB_OK / MB_ERR_TIMEOUT / MB_ERR_NO_SUBSCRIBER / ... */
+    size_t delivered;           /**< 实际执行的回调次数 */
+    /**
+     * 从调用**本次**推送函数到这次回调真正触发的实测毫秒数。
+     * 这是记录、调试与调优要看的时间；重试后的新通知会重新计时。
+     */
+    uint32_t elapsed_since_publish_ms;
+    mb_bus_t *bus;              /**< 所属总线 */
+    mb_node_t *node;            /**< 发布者节点；总线级推送时为 NULL */
+    const char *source;         /**< 发布者节点名；总线级推送时为 NULL */
+    const char *topic;          /**< 原始主题（深拷贝，回调期间有效） */
+    const void *payload;        /**< 原始负载（深拷贝，回调期间有效） */
+    size_t payload_len;         /**< 原始负载长度 */
+    mb_publish_opts_t opts;     /**< 原始发布选项 */
+    /**
+     * 本次推送请求时传入的超时配置，仅供重试时复用。
+     * **它不是实际等待时间** —— 实际间隔看 elapsed_since_publish_ms。
+     */
+    uint32_t requested_timeout_ms;
+    mb_async_done_handler_t handler; /**< 本次注册的回调（便于重试时复用） */
+    void *user_data;            /**< 注册时传入的 user_data */
+};
 
 /* -------------------------------------------------------------------------
  * 订阅选项
@@ -156,6 +214,11 @@ typedef struct mb_bus_stats {
     uint64_t async_enqueued;       /**< 累计成功进入异步队列的消息条数 */
     uint64_t async_dropped;        /**< 因队列满、等待超时而没能入队的条数 */
     uint64_t async_overwritten;    /**< 因「覆盖最旧」策略被丢弃的旧消息条数 */
+    /**
+     * 已入队、但等待消费/完成超时后被**撤销**的条数
+     * （见 mb_node_publish_async_wait 与 *_async_notify）。这些消息不会再投递。
+     */
+    uint64_t async_canceled;
 } mb_bus_stats_t;
 
 /* -------------------------------------------------------------------------

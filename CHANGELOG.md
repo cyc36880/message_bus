@@ -34,9 +34,60 @@
   编译期默认 + 单次发布覆盖，因为状态类主题（传感器当前值）适合覆盖、
   命令类主题（`motor/cmd`）绝不能覆盖。
 
+- **异步发布可以等待消费（await）**。普通异步发布返回时只代表「进了队列」，
+  发布方无法知道订阅方何时真正处理完。新增的 `*_async_wait()` 系列在入队后
+  阻塞（有限超时或 `MB_WAIT_FOREVER`），直到 pump 把这条消息投递给所有匹配
+  订阅者、回调**返回**为止，并可选返回实际回调次数：
+
+  ```c
+  size_t delivered = 0;
+  mb_node_publish_async_wait(ui, "motor/cmd", "speed=1200", 10, NULL, 200, &delivered);
+  /* 这里 on_command() 已经返回，命令确实生效了 */
+  ```
+
+  回调仍然跑在 pump 线程上，所以「异步换线程」和「同步握手」可以同时拿到；
+  多线程下的命令确认、请求-应答、逐帧推进不再需要自己搭条件变量。
+
+  超时会**当场把还没投递的消息从队列里摘掉**（计入新统计 `async_canceled`），
+  保证不会出现「调用方已经往下走了、回调却迟到」；只有 pump 恰好已经取走、
+  正在执行回调的极窄窗口例外。等待期间若被别的发布的覆盖策略顶掉，返回新错误码
+  **`MB_ERR_DROPPED`**。await 消息自身永不参与覆盖，也**不能**与
+  `MB_PUB_FLAG_ASYNC_OVERWRITE` 同用；在 pump 回调里等待一律被拒
+  （`MB_ERR_WOULD_DEADLOCK`，`MB_WAIT_NONE` 除外）；裸机上无法真正阻塞。
+
+- **非阻塞推送 + 完成回调（notify）**。await 会占住调用线程；UI 遮罩这类场景
+  需要「推送立刻返回，结果晚点在回调里处理」。新增的 `*_async_notify()` 系列
+  在登记通知后立即返回（内部用 `MB_WAIT_NONE`，队列满也不等），
+  成功 / 超时 / 无人订阅 / 入队失败都会在 **pump 线程**上回调一次：
+
+  ```c
+  mb_node_publish_async_notify(ui, "motor/cmd", "speed=1200", 10, NULL,
+                               200, on_command_done, NULL);
+  /* 立刻继续执行，UI 照常渲染 */
+  ```
+
+  回调收到 `mb_async_result_t`：`success`、`status`、`delivered`、
+  `elapsed_since_publish_ms`（从本次推送到回调触发的实测间隔，用于记录/调优），
+  以及原始 topic / payload / opts / timeout 的深拷贝。注意原始超时字段叫
+  `requested_timeout_ms`，它只是配置值，不是实际等待时间。
+  失败时可以在回调里直接再用这些字段重试。消息被 pump 处理但无人订阅时
+  status 为新错误码 **`MB_ERR_NO_SUBSCRIBER`**。
+
+  通知由 `mb_bus_pump()` 推进，超时也只在 pump 调用时检查（库依旧不创建
+  定时器）；不支持 `MB_PUB_FLAG_ASYNC_OVERWRITE`；销毁总线不会为未完成通知
+  补发回调。每次推送多两次小的堆分配（请求拷贝 + 通知/回执）。
+
 - **新 API**：`mb_node_publish_async()`、`mb_node_publish_to_async()`、
-  `mb_bus_publish_async()`、`mb_bus_pump()`、`mb_bus_async_pending()`、
+  `mb_bus_publish_async()`、`mb_node_publish_async_wait()`、
+  `mb_node_publish_to_async_wait()`、`mb_bus_publish_async_wait()`、
+  `mb_node_publish_async_notify()`、`mb_node_publish_to_async_notify()`、
+  `mb_bus_publish_async_notify()`、`mb_bus_pump()`、`mb_bus_async_pending()`、
   `mb_bus_async_topic_count()`。同步 API 签名**未变**。
+
+- **新增示例 `examples/05_async_await.c`**：「UI 线程发命令并等待电机回调确认」
+  的完整可运行版本，含 Win32 / pthread 的最小线程封装。
+- **新增示例 `examples/06_async_notify_overlay.c`**：点击 UI 显示等待遮罩、
+  非阻塞推送、成功/超时/无人订阅三条回调路径，以及回调内重试。
 
 - **`mb_os.h` 新增计数信号量**（`mb_os_sem_create/wait/signal/destroy`），
   四个 port 全部实现。POSIX 用手搓的条件变量信号量而非 `sem_t` ——
@@ -46,7 +97,8 @@
   完全去掉异步功能，不占任何 RAM**）、`MB_CONFIG_ASYNC_QUEUE_DEPTH`（默认 4）、
   `MB_CONFIG_ASYNC_OVERWRITE_OLDEST`（默认 0）。
 
-- **新统计字段**：`async_enqueued`、`async_dropped`、`async_overwritten`。
+- **新统计字段**：`async_enqueued`、`async_dropped`、`async_overwritten`、
+  `async_canceled`。
 
 - **回调里做无限等待的异步发布现在会被拒绝**，而不是把程序挂死。
   回调跑在 pump 线程上，而腾出队列空位的正是 pump 自己 —— 它此刻正卡在你的
@@ -60,13 +112,25 @@
   `MB_ERR_TIMEOUT` 并计入 `async_dropped`。裸机（`MB_OS_NONE`）不做这项检查 ——
   那里信号量本来就不阻塞，没有「等自己」可言（用 `MB_OS_CAN_BLOCK` 编译掉）。
 
-- **`tests/test_async.c`**：19 个用例，覆盖两级队列的独立性与 FIFO、
+- **`tests/test_async.c`**：38 个用例，覆盖两级队列的独立性与 FIFO、
   非阻塞 pump、满队列的等待/超时/覆盖三条路径、深拷贝、retained 语义、
   回调线程归属，「4 个生产者线程 + 1 个 pump 线程」的背压
   （生产者 `MB_WAIT_FOREVER`，一条都不许丢），以及
   「普通生产者与覆盖生产者混在同一主题上」的账目不变式
   （队列排空后断言 `async_enqueued == 投递数 + async_overwritten`），
   后者是那个记账竞态的回归测试。
+
+  新增的 await 用例覆盖：发布方在 pump 投递前确实阻塞、返回时回调已经执行完、
+  超时后消息当场撤销且不会迟到投递（`async_canceled`）、`MB_WAIT_NONE` 等价于
+  普通异步发布、无人订阅时仍以 `delivered == 0` 正常完成、多个订阅者时等全部
+  回调结束（`delivered` 等于命中数）、定向版本、100 轮双向握手、多生产者并发
+  await、pump 回调里被拒、显式覆盖标志被拒、被别的发布覆盖时返回
+  `MB_ERR_DROPPED`、队列满时总超时预算。
+
+  新增的 notify 用例覆盖：推送函数在队列满时仍然立即返回、回调只在 pump 线程
+  出现、成功 / `MB_ERR_NO_SUBSCRIBER` / `MB_ERR_TIMEOUT` 三条结果路径、
+  `elapsed_since_publish_ms` 计时、失败回调里的原始信息可以直接重试并成功、
+  参数非法时不排队也不留下通知。
 
   回调里发布的三种超时也分别钉住：`MB_WAIT_FOREVER` 被拒且不留痕迹，
   `MB_WAIT_NONE` 与具体毫秒数照常成功；同时断言「pump 结束后在别的线程上
@@ -132,10 +196,11 @@
 
 - **版本升到 1.1.0**。`mb_node_publish()` 等**同步 API 的签名与语义完全未变**，
   新增的异步 API 是一族并行的 `_async` 函数，订阅端代码一行都不用改。
-- ⚠️ **`mb_bus_stats_t` 末尾追加了 3 个字段**。这对**源码**兼容（用
+- ⚠️ **`mb_bus_stats_t` 末尾追加了 4 个字段**。这对**源码**兼容（用
   `mb_bus_get_stats()` 取值即可），但对**预编译二进制**是 ABI 破坏：
-  旧版库编译的调用方若把这个结构体按旧尺寸分配在栈上，会短 24 字节。
-  请连同库一起重新编译。
+  旧版库编译的调用方若把这个结构体按旧尺寸分配在栈上，会短 32 字节。
+  请连同库一起重新编译。错误码枚举末尾新增 `MB_ERR_DROPPED = -12`
+  与 `MB_ERR_NO_SUBSCRIBER = -13`，只用符号比较的代码不受影响。
 - **自建 port 若要支持异步投递，需要补 4 个函数**。`mb_os.h` 新增了计数信号量
   `mb_os_sem_create/wait/signal/destroy`（各约 5 行，仓库内四个 port 已全部实现，可照抄）。
   **不用异步投递则不必补** —— 把这四个函数的调用全部包在

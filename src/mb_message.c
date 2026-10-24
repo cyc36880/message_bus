@@ -82,6 +82,11 @@ void mb_owned_message_free(mb_owned_message_t *msg)
     if (msg == NULL) {
         return;
     }
+#if MB_CONFIG_ASYNC_MAX_TOPICS > 0
+    /* 回执由异步队列负责结束并归还引用，释放消息前必须先清空。
+     * 这里能命中说明某条路径漏了 ack_finish/discard 处理。 */
+    MB_CONFIG_ASSERT(msg->ack == NULL);
+#endif
     mb_os_free(msg->topic);
     mb_os_free(msg->payload);
     mb_os_free(msg->source);
