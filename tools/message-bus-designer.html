@@ -186,16 +186,44 @@ pre.code .cl.flash{animation:codeflash 1.8s ease-out}
   background:var(--bg2); border:1px solid var(--line); border-radius:var(--radius);
   margin-bottom:18px; overflow:hidden;
 }
-.graph-bus > header{display:flex; align-items:baseline; gap:10px; padding:8px 12px; border-bottom:1px solid var(--line)}
-.graph-bus > header .gname{font-weight:600}
-.graph-bus > header .gmeta{color:var(--fg-mute); font-size:11px; font-family:var(--mono)}
-.graph-scroll{overflow:auto}
+.graph-bus > header{display:flex; align-items:center; gap:8px; padding:7px 12px;
+  border-bottom:1px solid var(--line); flex-wrap:nowrap; min-width:0}
+.graph-bus > header .gname{font-weight:600; flex:0 0 auto; white-space:nowrap}
+/* 统计那一段可以省略，别把右边的按钮挤到换行（窄屏 + 小分辨率时特别明显） */
+.graph-bus > header .gmeta{color:var(--fg-mute); font-size:11px; font-family:var(--mono);
+  flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.graph-bus > header button.tiny{flex:0 0 auto; white-space:nowrap}
+.graph-scroll{overflow:hidden; position:relative}
 /* SVG 默认是 inline，底下会多出一条基线缝，撑出无谓的滚动条；块级化即可。
-   画布高度由脚本按内容 + 可视区算出，所以这里不再限制高度。 */
-.graph-scroll svg{display:block}
+   关系图靠 transform 平移、靠改 CSS 宽高缩放，所以画布用绝对定位、
+   从可视区左上角起算 —— 这样「平移到哪儿」就是一个纯几何量，不需要滚动条。 */
+.graph-scroll svg{display:block; position:absolute; left:0; top:0; transform-origin:0 0}
+.graph-bus > header .zoombox{display:flex; align-items:center; gap:5px; margin-left:auto}
+.graph-bus > header .zoombox b{font-family:var(--mono); min-width:42px; text-align:center;
+  color:var(--fg-dim); font-weight:400}
 .graph-empty{padding:20px; color:var(--fg-mute); text-align:center}
-.legend{display:flex; gap:16px; padding:8px 12px; border-top:1px solid var(--line); color:var(--fg-dim); font-size:11px; flex-wrap:wrap}
-.legend i{display:inline-block; width:22px; height:0; border-top:2px solid; vertical-align:middle; margin-right:5px}
+/* 图例：一行、不换行。分辨率低的屏幕上换行会把下方内容挤掉一大块。 */
+.legend{display:flex; gap:14px; padding:4px 10px; border-top:1px solid var(--line);
+  color:var(--fg-dim); font-size:10px; white-space:nowrap; overflow:hidden;
+  align-items:center; flex:0 0 auto}
+.legend > span{flex:0 0 auto}
+.legend i{display:inline-block; width:18px; height:0; border-top:2px solid; vertical-align:middle; margin-right:4px}
+.legend .lhint{color:var(--fg-mute); cursor:help}
+
+/* 两张关系图之间的高度把手：上下拖动，按像素分配上下两张图的高度。
+   放在两个 .graph-bus 的间隙里，本身占 10px 左右，不抢地方。 */
+.graph-split{
+  height:12px; margin:-6px 0 6px; display:flex; align-items:center; justify-content:center;
+  cursor:ns-resize; user-select:none; position:relative; z-index:2;
+}
+.graph-split::before{content:""; position:absolute; left:0; right:0; top:50%;
+  height:1px; background:var(--line)}
+.graph-split .grip{
+  position:relative; font-size:11px; line-height:12px; padding:0 9px; border-radius:8px;
+  color:var(--fg-mute); background:var(--bg2); border:1px solid var(--line);
+}
+.graph-split:hover .grip{color:var(--fg); border-color:var(--accent)}
+.graph-split.dragging .grip{color:var(--fg); border-color:var(--accent); background:var(--bg3)}
 svg text{font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
 .gnode rect{fill:var(--bg3); stroke:var(--line); stroke-width:1.2; cursor:grab}
 .gnode:active rect{cursor:grabbing}
@@ -1611,63 +1639,56 @@ function renderGraph(){
     host.innerHTML = `<div class="vnone" style="padding:40px">还没有总线，切到表格视图先建一条。</div>`;
     return;
   }
+  /* 每条总线各画一张图，但它们共用同一张「边几何信息」表。
+     这张表必须在**循环之前**清空一次：
+     如果放在 renderBusGraph() 里清，画第二条总线时会把第一条总线的条目全丢掉，
+     于是第一条总线上的线在 mousedown 里查不到 info —— 既拖不动也点不开改色面板。 */
+  graphEdges = new Map();
+  graphPos   = new Map();
+  graphOrphans = [];
   let html = "";
-  for (const bus of doc.buses) html += renderBusGraph(bus);
+  doc.buses.forEach((bus, i) => {
+    /* 两张图之间夹一条可以上下拉的把手：手动分配上下两张图的高度。 */
+    if (i > 0){
+      html += `<div class="graph-split" data-split-top="${esc(doc.buses[i - 1].id)}"
+        data-split-bottom="${esc(bus.id)}" title="上下拖动：调整这两张关系图的高度">
+        <span class="grip">⇕</span></div>`;
+    }
+    html += renderBusGraph(bus);
+  });
+  /* 图例压成一行：笔记本分辨率不高时，多行图例白吃掉一大块高度。
+     详细的操作说明收进 ⓘ 的 title 里。 */
   html += `<div class="legend">
-    <span><i style="border-color:var(--pub)"></i>投递路径（发布者 → 订阅者，虚线朝目标流动）</span>
+    <span><i style="border-color:var(--pub)"></i>投递路径</span>
     <span><i style="border-color:var(--accent)"></i>自我投递</span>
     <span><i style="border-color:var(--fg-mute); border-top-style:dashed"></i>无人订阅</span>
-    <span style="color:var(--fg-mute)">单击方框跳到表格视图；拖动方框调整位置；
-      <b style="color:var(--fg-dim)">拖动线上的标签可改变线的形状，单击可改颜色</b>；
-      Ctrl+滚轮缩放</span>
-    <span class="zoom">
-      <button class="tiny" data-act="zoom-out" title="缩小">−</button>
-      <button class="tiny" data-act="zoom-reset" id="zoom-level" title="恢复 100%">100%</button>
-      <button class="tiny" data-act="zoom-in" title="放大">+</button>
-    </span>
+    <span class="lhint" title="单击方框跳到表格视图；拖动方框调整位置；拖动线上的标签改变线的形状，单击可改颜色；每张图各自缩放（Ctrl+滚轮 或标题栏 − / +）；滚轮或拖空白平移（最多拖到图刚好看不见，双击空白处摆回正中）；上下拖动图之间的 ⇕ 可调整两张图的高度">ⓘ 操作提示</span>
   </div>`;
   host.innerHTML = html;
 
-  /* 画布至少铺满可视区。自动排版往往只有一两百像素高，下面那片空白既不是
-     SVG、也收不到鼠标事件 —— 看上去就是「高度太小」，而且没地方把节点拖开。
-     把最后一条总线的画布撑高到填满，这片空白就成了真正能拖的画布。
-
-     算的是画布「应该」有多高，再一次性设成那个值，不加增量 ——
-     写增量的话，面板一滚动 rect 就偏移，每次重绘又多加一截，画布会自己长高。
-
-     注意 host（#view-graph）自身是「按内容撑高」的，它的 clientHeight 永远
-     等于内容高度，拿它当可视区永远算不出该长高。真正滚动的是外层 .pane，
-     所以要量 pane 的可视高度，再从 host 里减掉表头、图例、外边距这些非画布内容。
-     视图隐藏时 pane 高度为 0，want 为负，自然跳过。 */
-  const busEls = host.querySelectorAll(".graph-bus");
-  const last   = busEls.length ? busEls[busEls.length - 1] : null;
-  const scroll = last ? last.querySelector(".graph-scroll") : null;
-  const svg    = scroll ? scroll.querySelector("svg") : null;
-  const pane   = host.closest(".pane") || host;
-  if (svg && scroll){
-    const w   = parseFloat(svg.getAttribute("width"))  || 0;
-    const h   = parseFloat(svg.getAttribute("height")) || 0;
-    const cs  = getComputedStyle(pane);
-    const visible = pane.clientHeight - (parseFloat(cs.paddingTop) || 0)
-                                      - (parseFloat(cs.paddingBottom) || 0);
-    const rest    = host.offsetHeight - h;         /* 同一容器内除画布以外的内容 */
-    const want    = visible - rest;                /* 铺满可视区所需的画布高度 */
-    if (want > 0 && want < 20000){
-      if (want > h + 1){
-        svg.setAttribute("height", want);
-        svg.setAttribute("viewBox", `0 0 ${w} ${want}`);
-      }
-      /* 关键：把「滚动」这件事锁在 .graph-scroll 这一层。
-         .graph-scroll 没有写死高度，高度是按内容（SVG）撑的 —— 于是节点被拖远、
-         SVG 长高之后，滚动条跑到外层 .pane 上，而「拖空白平移」平的是
-         .graph-scroll，纵向就完全拖不动。给它一个上限，SVG 超出多少就在它内部滚多少。 */
-      scroll.style.maxHeight = want + "px";
-    }
-  }
-
-  /* 缩放要在「撑高画布」之后应用 —— 撑高改的是 width/height 属性，
-     而 CSS 尺寸是从这些属性乘出来的，顺序反了就会用旧的逻辑尺寸去算。 */
-  applyGraphZoom();
+  /* 每个 .graph-scroll 的高度：
+       1. 只有一张图时 = 可视区剩下的全部高度（尽可能大，不留白）；
+       2. 多张图时默认均分剩下的高度；
+       3. 用户拉过中间的 ⇕ 之后，用拉出来的高度（记在视野状态里）。
+     「剩下的高度」= 面板可视高度 - 表头 / 图例 / 间距这些非画布内容。
+     量法：innerHTML 刚写好时 .graph-scroll 里只有绝对定位的 svg、自身高度为 0，
+     所以 host.offsetHeight 减掉各画布高度正好是这些「外壳」的高度。 */
+  const busEls = Array.from(host.querySelectorAll(".graph-bus[data-gbus]"));
+  const scrolls = busEls.map(b => b.querySelector(".graph-scroll"));
+  const pane = host.closest(".pane") || host;
+  const cs   = getComputedStyle(pane);
+  const visible = Math.max(160, pane.clientHeight - (parseFloat(cs.paddingTop) || 0)
+                                                - (parseFloat(cs.paddingBottom) || 0));
+  const chrome = Math.max(0, host.offsetHeight - scrolls.reduce((a, sc) => a + (sc ? sc.clientHeight : 0), 0));
+  const available = Math.max(200, visible - chrome);
+  const base = Math.max(160, Math.floor(available / Math.max(1, busEls.length)));
+  busEls.forEach((busEl, i) => {
+    const scroll = scrolls[i];
+    if (!scroll) return;
+    const v = graphView(busEl.dataset.gbus);
+    scroll.style.height = Math.round(v.h != null ? v.h : base) + "px";
+    applyGraphView(busEl.dataset.gbus, !dragState);
+  });
 }
 
 function renderBusGraph(bus){
@@ -1744,6 +1765,10 @@ function renderBusGraph(bus){
   /* 在图上拖过的节点：手工坐标覆盖自动排版 */
   for (const n of nodes) if (n.x != null && n.y != null) pos.set(n.id, { x: n.x, y: n.y });
 
+  /* 记一份「节点当前画在哪」的坐标表：拖动节点时要按它实时重算连线的端点。
+     只存模型里的 x/y 不够 —— 没拖过的节点在模型里是 null，位置是自动排出来的。 */
+  for (const n of nodes) graphPos.set(n.id, pos.get(n.id));
+
   /* 画布尺寸：先按自动排版算一遍，再把**手工拖过的节点**也算进来。
      只按自动排版算的话，拖到自动范围之外的节点会落到 viewBox 外面被裁掉 ——
      表现出来就是「画布太小、节点拖不出去、松手后人不见了」。 */
@@ -1776,7 +1801,6 @@ function renderBusGraph(bus){
     laneGroups.get(k).push(i);
   });
 
-  graphEdges = new Map();             /* 拖动时要用的几何信息，每次重绘都重建 */
   const draws = [];
 
   edges.forEach((e, idx) => {
@@ -1786,51 +1810,28 @@ function renderBusGraph(bus){
     const fromName = nameOf(bus, e.from), toName = nameOf(bus, e.to);
     if (fromName == null || toName == null) return;
 
-    /* ── 端点与默认控制点 ──
-       出口按「对方在哪个方向」来选：目标在左边就从左边缘出去。
-       写死右边缘出、左边缘入的话，把节点拖到左边之后线会绕一整圈。 */
-    let p1, p2, d1, d2, horiz = true;
-    if (self){
-      p1 = { x: A.x + 26,           y: A.y };
-      p2 = { x: A.x + NODE_W - 26,  y: A.y };
-      d1 = { x: 0, y: -34 }; d2 = { x: 0, y: -34 };
-    } else {
-      const acx = A.x + NODE_W / 2, acy = A.y + NODE_H / 2;
-      const bcx = B.x + NODE_W / 2, bcy = B.y + NODE_H / 2;
-      const ddx = bcx - acx, ddy = bcy - acy;
-      if (Math.abs(ddx) >= Math.abs(ddy)){
-        const s = ddx >= 0 ? 1 : -1;
-        p1 = { x: acx + s * NODE_W / 2, y: acy };
-        p2 = { x: bcx - s * NODE_W / 2, y: bcy };
-        const pull = Math.max(30, Math.abs(p2.x - p1.x) / 2);
-        d1 = { x:  s * pull, y: 0 };
-        d2 = { x: -s * pull, y: 0 };
-      } else {
-        const s = ddy >= 0 ? 1 : -1;
-        horiz = false;
-        p1 = { x: acx, y: acy + s * NODE_H / 2 };
-        p2 = { x: bcx, y: bcy - s * NODE_H / 2 };
-        const pull = Math.max(30, Math.abs(p2.y - p1.y) / 2);
-        d1 = { x: 0, y:  s * pull };
-        d2 = { x: 0, y: -s * pull };
-      }
-    }
+    /* ── 端点与默认控制点 ──（算法在 edgeEnds() 里，拖动时用的是同一份，
+       两边算法必须一致，否则松手重绘的那一帧线会突然换个形状） */
+    const geo = edgeEnds(A, B, self);
+    const { p1, p2, d1, d2, horiz } = geo;
 
     /* ── 车道偏移（自动）+ 手工偏移（拖出来的）──
        两者要分开留着：拖完之后写回模型的只是**手工**那部分，
        车道偏移是算出来的、下次排版还会重算。 */
-    let laneX = 0, laneY = 0;
+    let laneX = 0, laneY = 0, laneMag = 0;
     if (!self){
       const lo = e.from < e.to ? e.from : e.to;
       const hi = e.from < e.to ? e.to : e.from;
       const lane = (laneGroups.get(`${lo}\u0000${hi}`) || []).indexOf(idx);
       /* 0 → +1、1 → -1、2 → +2、3 → -2…… 同组的两条反向边天然一正一负。 */
-      const mag = LANE_STEP * (Math.floor(lane / 2) + 1) * (lane % 2 === 0 ? 1 : -1);
-      if (horiz) laneY = mag; else laneX = mag;
+      laneMag = LANE_STEP * (Math.floor(lane / 2) + 1) * (lane % 2 === 0 ? 1 : -1);
+      if (horiz) laneY = laneMag; else laneX = laneMag;
     }
     const style = findEdgeStyle(bus, fromName, toName, e.topic);
-    const ox = laneX + (style ? (style.dx || 0) : 0);
-    const oy = laneY + (style ? (style.dy || 0) : 0);
+    const sdx = style ? (style.dx || 0) : 0;
+    const sdy = style ? (style.dy || 0) : 0;
+    const ox = laneX + sdx;
+    const oy = laneY + sdy;
 
     const c1x = p1.x + d1.x + ox, c1y = p1.y + d1.y + oy;
     const c2x = p2.x + d2.x + ox, c2y = p2.y + d2.y + oy;
@@ -1847,8 +1848,9 @@ function renderBusGraph(bus){
     const sel   = selectedEdge && selectedEdge.busId === busId
                   && selectedEdge.key === edgeKeyOf(fromName, toName, e.topic);
 
-    graphEdges.set(key, { busId, from: fromName, to: toName, topic: e.topic,
-                          p1, p2, d1, d2, ox, oy, laneX, laneY, self, label });
+    graphEdges.set(key, { busId, from: fromName, to: toName, fromId: e.from, toId: e.to,
+                          topic: e.topic, p1, p2, d1, d2, ox, oy, laneX, laneY,
+                          laneMag, sdx, sdy, self, label });
     /* 箭头 marker 是**每条边一个**，不是按颜色共用。共用的话改一条边的颜色
        就得把同色的其它边的箭头一起改；各自一个才能只动自己那一个。 */
     draws.push({ key, cls, d, lx, ly, label, color, fill, sel,
@@ -1885,15 +1887,17 @@ function renderBusGraph(bus){
     </g>`);
   }
 
-  /* 无人订阅的主题：画成虚线小药丸 */
+  /* 无人订阅的主题：画成虚线小药丸。
+     药丸本身是固定位置，只有「从节点连过去」的那段曲线挂在节点上，
+     所以拖动节点时它也要跟着重画（否则拖动中线会和方块脱开、松手再弹回去）。 */
   orphans.forEach((o, i) => {
     const a = pos.get(o.nodeId);
     if (!a) return;
     const x = PAD + (maxLayer + 1) * COL_GAP, y = PAD + i * ROW_GAP + 12;
     const w = Math.min(190, o.topic.length * 6.2 + 20);
-    const y1 = a.y + NODE_H / 2, y2 = y + 10;
-    const dx = Math.max(30, (x - (a.x + NODE_W)) / 2);
-    svg.push(`<path class="gedge orphan" d="M ${a.x + NODE_W} ${y1} C ${a.x + NODE_W + dx} ${y1}, ${x - dx} ${y2}, ${x} ${y2}"/>`);
+    const ghost = { busId, nodeId: o.nodeId, x, y2: y + 10 };
+    graphOrphans.push(ghost);
+    svg.push(`<path class="gedge orphan" data-orphan="${esc(`${busId}#${graphOrphans.length - 1}`)}" d="${orphanPath(a, ghost)}"/>`);
     svg.push(`<rect class="gpill" x="${x}" y="${y}" width="${w}" height="20" rx="10"/>`);
     svg.push(`<text class="gpill-text" x="${x + 10}" y="${y + 14}">${esc(o.topic)}</text>`);
   });
@@ -1914,11 +1918,16 @@ function renderBusGraph(bus){
   svg.push("</svg>");
 
   const nEdge = edges.filter(e => e.from !== e.to).length;
-  return `<div class="graph-bus">
+  return `<div class="graph-bus" data-gbus="${esc(busId)}">
     <header>
       <span class="gname">${esc(bus.name || "(未命名总线)")}</span>
       <span class="gmeta">节点 ${nodes.length} · 发布 ${pubList.filter(p => !p.system).length} · 订阅 ${nodes.reduce((a, n) => a + n.subscribes.length, 0)} · 投递路径 ${nEdge}${orphans.length ? ` · 无人订阅 ${orphans.length}` : ""}${bus.nodeEvents ? " · 含 $mb 事件" : ""}</span>
-      <span style="flex:1"></span>
+      <span class="zoombox" title="这张图的缩放与位置（各总线互不影响）">
+        <button class="tiny" data-act="zoom-out" data-bus="${esc(busId)}" title="缩小">−</button>
+        <button class="tiny zoom-level" data-act="zoom-reset" data-bus="${esc(busId)}" title="恢复 100% 并居中">100%</button>
+        <button class="tiny" data-act="zoom-in" data-bus="${esc(busId)}" title="放大">+</button>
+        <button class="tiny" data-act="zoom-fit" data-bus="${esc(busId)}" title="缩放到刚好放得下">适应</button>
+      </span>
       <button class="tiny" data-act="reset-layout" data-bus="${esc(busId)}">重新自动排版</button>
     </header>
     <div class="graph-scroll">${svg.join("")}</div>
@@ -1928,24 +1937,161 @@ function renderBusGraph(bus){
 function nameOf(bus, nodeId){ const n = bus.nodes.find(x => x.id === nodeId); return n ? n.name : null; }
 
 /* ── 拖动节点：位置写回 XML 的 x / y ──────────────────────────────────
-   拖完整体重绘一次，因为连线是按坐标算好的，光改 transform 会让边留在原地。 */
+   拖动期间用 relayoutNodeEdges() 按重绘那套算法实时重算连线，松手后再整体
+   重绘一次 —— 两边结果一致，所以松手那一帧不会跳。 */
 let dragState = null;
-/* 空白处左键拖拽 = 平移画布。实现的其实就是滚动那个容器。 */
+/* 空白处左键拖拽 = 平移这张图（改动的是 svg 的 translate，不是滚动条）。 */
 let panState = null;
+/* 拖两张图中间的 ⇕：按像素重新分配上下两张图的高度。 */
+let splitState = null;
 /* 拖线条 / 拖标签 = 给这条边攒一个手工偏移。 */
 let edgeState = null;
 
 /* key(`${busId}#${idx}`) -> 该边的几何信息；每次重绘重建。
    拖动期间不动模型，松手才写回去 —— 所以这块信息得活到 mouseup。 */
 let graphEdges = new Map();
+/* nodeId -> 这个节点当前画在画布上的坐标（含自动排版的结果）。
+   拖动节点时靠它实时重算连线，光看模型里的 x/y 不够（没拖过的节点是 null）。 */
+let graphPos = new Map();
+/* 「无人订阅」虚线的固定落点：拖动节点时按它重画那段曲线。 */
+let graphOrphans = [];
 /* 选中的边。存「名字 + 主题」算出的键（就是 XML 里认的那个），
    重绘之后 idx 会变，但这个名字组合不会。 */
 let selectedEdge = null;          /* { busId, key } */
 
-/* 缩放是纯视野状态，不进 XML、也不进 localStorage：
-   它描述的是「你现在想看多大」，不是这份设计的一部分。 */
-let graphZoom = 1;
+/* ── 每张关系图各自的视野 ──────────────────────────────────────────────
+   缩放和平移都是纯视野状态，不进 XML、也不进 localStorage：
+   它描述的是「你现在想看多大、看哪一块」，不是这份设计的一部分。
+
+   每张图（每条总线）一套 { zoom, tx, ty }，互不影响。平移 tx/ty 是屏幕像素，
+   用 CSS transform 落在 <svg> 上；可视区是 .graph-scroll，overflow:hidden。
+   这样即便图比可视区小，也能在框里拖来拖去 —— 用滚动条是做不到这件事的
+   （内容没溢出就没有滚动范围）。
+
+   fit=true 表示「这张图处于自动适配状态」：可视区一变（拖 ⇕、拉窗口）就重新
+   缩到放得下；一旦手动缩放（− / + / Ctrl+滚轮 / 100%）就退出这个状态，
+   免得用户调好的比例被下一次尺寸变化冲掉。 */
+let graphViews = new Map();           /* busId -> { zoom, tx, ty, placed, fit, h } */
 const ZOOM_MIN = 0.35, ZOOM_MAX = 3;
+
+function graphView(busId){
+  let v = graphViews.get(busId);
+  if (!v){ v = { zoom: 1, tx: 0, ty: 0, placed: false, fit: true, h: null, vw: 0, vh: 0 }; graphViews.set(busId, v); }
+  return v;
+}
+
+function graphParts(busId){
+  const el = document.querySelector(`.graph-bus[data-gbus="${busId}"]`);
+  const scroll = el && el.querySelector(".graph-scroll");
+  return { el, scroll, svg: scroll && scroll.querySelector("svg") };
+}
+
+/* 平移量的合法区间：[−内容, 视口]。
+   也就是「最多拖到图刚好看不见」：
+     往左拖——图的**右**边缘一直可以拖到框的**左**边缘（t = −内容宽）；
+     往右拖——图的**左**边缘一直可以拖到框的**右**边缘（t = 视口宽）；
+   上下同理。中途允许出现空白，图可以被拖出去，但总有一条边还贴着框，
+   再往外拖不动 —— 这样图不会被拖到完全够不着的地方（拖丢了按「适应」或
+   双击空白处就回来）。 */
+function clampPan(t, view, content){
+  return Math.min(view, Math.max(-content, t));
+}
+
+/* 缩放 / 平移一次落到 DOM 上。doClamp=false 时只更新尺寸和位移不做边界修正
+   （拖着节点把画布撑大的那一瞬间用，免得边界修正把鼠标底下的东西挪走）。 */
+function applyGraphView(busId, doClamp){
+  const v = graphView(busId);
+  const { el, scroll, svg } = graphParts(busId);
+  if (!svg || !scroll) return;
+  const lw = parseFloat(svg.getAttribute("width"))  || 0;
+  const lh = parseFloat(svg.getAttribute("height")) || 0;
+  if (!lw || !lh) return;
+
+  const vw = scroll.clientWidth, vh = scroll.clientHeight;
+  const sizeChanged = (vw !== v.vw || vh !== v.vh);
+  v.vw = vw; v.vh = vh;
+
+  /* 自动适配状态：可视区多大，就把整张图缩到多大（装得下就是 100%）。
+     「尽可能大」= 一屏能看全，而不是让字大到看不全。 */
+  if (v.fit && vw > 0 && vh > 0){
+    const fitZ = Math.min(vw / lw, vh / lh);
+    v.zoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, fitZ * 0.98));
+  }
+  svg.style.width  = (lw * v.zoom) + "px";
+  svg.style.height = (lh * v.zoom) + "px";
+
+  if (doClamp !== false){
+    v.tx = clampPan(v.tx, vw, lw * v.zoom);
+    v.ty = clampPan(v.ty, vh, lh * v.zoom);
+  }
+  /* 首次显示、或者自动适配时可视区变了（拖 ⇕ / 拉窗口）：摆到正中 */
+  if (vw > 0 && vh > 0 && (!v.placed || (v.fit && sizeChanged))){
+    v.tx = clampPan((vw - lw * v.zoom) / 2, vw, lw * v.zoom);
+    v.ty = clampPan((vh - lh * v.zoom) / 2, vh, lh * v.zoom);
+    v.placed = true;
+  }
+  svg.style.transform = `translate(${v.tx}px, ${v.ty}px)`;
+
+  const lvl = el && el.querySelector(".zoom-level");
+  if (lvl) lvl.textContent = Math.round(v.zoom * 100) + "%";
+}
+
+/* 缩放并保持某个屏幕点底下的内容不动（px/py 是相对可视区左上角） */
+function zoomGraphAt(busId, next, px, py){
+  const v = graphView(busId);
+  const before = v.zoom;
+  v.zoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, next));
+  if (v.zoom === before) return;
+  v.fit = false;                        /* 手动调过就不再自动适配 */
+  if (px == null){                      /* 没给锚点就按中心缩放 */
+    const { scroll } = graphParts(busId);
+    px = scroll ? scroll.clientWidth / 2 : 0;
+    py = scroll ? scroll.clientHeight / 2 : 0;
+  }
+  const cx = (px - v.tx) / before, cy = (py - v.ty) / before;
+  v.tx = px - cx * v.zoom;
+  v.ty = py - cy * v.zoom;
+  applyGraphView(busId);
+}
+
+/* 把图摆到可视区正中（w/h 用当前缩放算好的尺寸） */
+function centerGraphView(busId){
+  const v = graphView(busId);
+  const { scroll, svg } = graphParts(busId);
+  if (!scroll || !svg){ applyGraphView(busId); return; }
+  const cw = (parseFloat(svg.getAttribute("width"))  || 0) * v.zoom;
+  const ch = (parseFloat(svg.getAttribute("height")) || 0) * v.zoom;
+  v.tx = clampPan((scroll.clientWidth  - cw) / 2, scroll.clientWidth,  cw);
+  v.ty = clampPan((scroll.clientHeight - ch) / 2, scroll.clientHeight, ch);
+  v.placed = true;
+  applyGraphView(busId);
+}
+
+/* 100% 并居中 */
+function resetGraphView(busId){
+  const v = graphView(busId);
+  v.zoom = 1;
+  v.fit = false;
+  centerGraphView(busId);
+}
+
+/* 缩放到整张图刚好放得下，并居中；之后可视区再变也继续自动适配 */
+function fitGraphView(busId){
+  const v = graphView(busId);
+  v.fit = true;
+  applyGraphView(busId);
+  centerGraphView(busId);
+}
+
+/* 手动设定某张图的高度（拖动两张图中间的 ⇕ 时用），并重新夹一下平移边界。 */
+function setGraphHeight(busId, h){
+  const { scroll } = graphParts(busId);
+  if (!scroll) return;
+  const v = graphView(busId);
+  v.h = Math.max(140, Math.round(h));   /* 与拖分隔条时的下限保持一致 */
+  scroll.style.height = v.h + "px";
+  applyGraphView(busId);
+}
 
 /* 颜色一律归一成 #rrggbb。XML 是手写友好的，从文件里读进来的 color 属性
    可能是任何东西；直接塞进 SVG 属性/样式迟早出事。 */
@@ -1955,23 +2101,6 @@ function normColor(s){
   if (/^#[0-9a-fA-F]{3}$/.test(t)) return ("#" + t[1] + t[1] + t[2] + t[2] + t[3] + t[3]).toLowerCase();
   return "";
 }
-
-/* 把逻辑尺寸（width / height 属性）乘上缩放，落到 CSS 尺寸上。
-   viewBox 保持逻辑尺寸不变，所以缩放是浏览器替我们做的 ——
-   不用自己乘坐标，也就不会漏掉哪一处。 */
-function applyGraphZoom(){
-  for (const svg of document.querySelectorAll(".graph-scroll > svg")){
-    const w = parseFloat(svg.getAttribute("width"))  || 0;
-    const h = parseFloat(svg.getAttribute("height")) || 0;
-    if (!w || !h) continue;
-    svg.style.width  = (w * graphZoom) + "px";
-    svg.style.height = (h * graphZoom) + "px";
-  }
-  const lvl = document.getElementById("zoom-level");
-  if (lvl) lvl.textContent = Math.round(graphZoom * 100) + "%";
-}
-
-function setGraphZoom(z){ graphZoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z)); applyGraphZoom(); }
 
 /* 屏幕坐标 → SVG 用户坐标。
    getBoundingClientRect() 给的是缩放**之后**的 CSS 盒子，viewBox 是缩放前的
@@ -1994,9 +2123,90 @@ function paintEdge(key, g, ox, oy){
   const d  = `M ${g.p1.x} ${g.p1.y} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${g.p2.x} ${g.p2.y}`;
   const lx = (g.p1.x + g.p2.x) / 2 + 0.375 * (g.d1.x + g.d2.x) + 0.75 * ox;
   const ly = (g.p1.y + g.p2.y) / 2 + 0.375 * (g.d1.y + g.d2.y) + 0.75 * oy;
+  /* 画完就把偏移记回这张表里。不然「屏幕上这条线现在长什么样」和表里记的
+     ox/oy 会越走越远：下一次按下时 mousedown 拿的还是旧的 ox，第一帧就把
+     上次拖出来的偏移整个抹掉 —— 表现就是「拖一下就突然跳回别处」。 */
+  g.ox = ox; g.oy = oy;
   for (const el of document.querySelectorAll(`[data-edge-key="${key}"]`)){
     if (el.tagName === "path") el.setAttribute("d", d);
     else el.setAttribute("transform", `translate(${lx},${ly})`);
+  }
+}
+
+/* ── 端点与默认控制点 ──────────────────────────────────────────────────
+   出口按「对方在哪个方向」来选：目标在左边就从左边缘出去。
+   写死右边缘出、左边缘入的话，把节点拖到左边之后线会绕一整圈。
+
+   单独抽成函数是因为**拖动节点时每一帧都要算同一件事**：画图和拖动必须用
+   同一份算法，否则拖动中是我算的形状、松手重绘是另一套形状，交界那一帧
+   线就会「跳」一下。 */
+function edgeEnds(A, B, self){
+  if (self){
+    return {
+      p1: { x: A.x + 26,            y: A.y },
+      p2: { x: A.x + NODE_W - 26,   y: A.y },
+      d1: { x: 0, y: -34 }, d2: { x: 0, y: -34 }, horiz: true
+    };
+  }
+  const acx = A.x + NODE_W / 2, acy = A.y + NODE_H / 2;
+  const bcx = B.x + NODE_W / 2, bcy = B.y + NODE_H / 2;
+  const ddx = bcx - acx, ddy = bcy - acy;
+  if (Math.abs(ddx) >= Math.abs(ddy)){
+    const s = ddx >= 0 ? 1 : -1;
+    const p1 = { x: acx + s * NODE_W / 2, y: acy };
+    const p2 = { x: bcx - s * NODE_W / 2, y: bcy };
+    const pull = Math.max(30, Math.abs(p2.x - p1.x) / 2);
+    return { p1, p2, d1: { x:  s * pull, y: 0 }, d2: { x: -s * pull, y: 0 }, horiz: true };
+  }
+  const s = ddy >= 0 ? 1 : -1;
+  const p1 = { x: acx, y: acy + s * NODE_H / 2 };
+  const p2 = { x: bcx, y: bcy - s * NODE_H / 2 };
+  const pull = Math.max(30, Math.abs(p2.y - p1.y) / 2);
+  return { p1, p2, d1: { x: 0, y:  s * pull }, d2: { x: 0, y: -s * pull }, horiz: false };
+}
+
+/* 「无人订阅」那条虚线：从节点右边缘连到固定的药丸上。 */
+function orphanPath(a, o){
+  const y1 = a.y + NODE_H / 2;
+  const dx = Math.max(30, (o.x - (a.x + NODE_W)) / 2);
+  return `M ${a.x + NODE_W} ${y1} C ${a.x + NODE_W + dx} ${y1}, ${o.x - dx} ${o.y2}, ${o.x} ${o.y2}`;
+}
+
+/* 拖动节点时，挂在这个节点上的连线要实时跟着走 —— 而且是按**重绘时那套
+   算法**重算，不是把旧曲线整体平移。
+
+   为什么不能只平移：重绘时端点落在方框的哪条边、控制点拉多长、车道偏移
+   走在 x 轴还是 y 轴，都取决于两个节点的相对位置。拖动过程中只做平移的话，
+   这些量全是旧值；松手 renderGraph() 一按新位置重算，线的形状就整个变了 ——
+   看起来就是「一松手线就乱跳」。所以这里每帧都重算一遍，和松手后的结果
+   完全一致（松手时唯一还会变的是车道分组序号，只在增删边时才变）。 */
+function relayoutNodeEdges(busId, nodeId, nodeName){
+  for (const [key, g] of graphEdges){
+    if (g.busId !== busId) continue;
+    if (g.fromId !== nodeId && g.toId !== nodeId) continue;
+    if (g.from !== nodeName && g.to !== nodeName) continue;   /* 同名不同节点，别误伤 */
+    const A = graphPos.get(g.fromId), B = graphPos.get(g.toId);
+    if (!A || !B) continue;
+
+    const geo = edgeEnds(A, B, g.self);
+    g.p1 = geo.p1; g.p2 = geo.p2; g.d1 = geo.d1; g.d2 = geo.d2;
+    /* 车道偏移要跟着换轴：横向走线时车道让在 y 上，纵向走线时让在 x 上。
+       不换轴的话，松手重绘会把这条线横着挪出去一段。 */
+    g.laneX = geo.horiz ? 0 : g.laneMag;
+    g.laneY = geo.horiz ? g.laneMag : 0;
+    g.ox = g.laneX + g.sdx;
+    g.oy = g.laneY + g.sdy;
+    paintEdge(key, g, g.ox, g.oy);
+  }
+
+  /* 药丸那条虚线也跟着重画 */
+  for (let i = 0; i < graphOrphans.length; i++){
+    const o = graphOrphans[i];
+    if (o.busId !== busId || o.nodeId !== nodeId) continue;
+    const a = graphPos.get(o.nodeId);
+    if (!a) continue;
+    const el = document.querySelector(`path[data-orphan="${busId}#${i}"]`);
+    if (el) el.setAttribute("d", orphanPath(a, o));
   }
 }
 
@@ -2041,6 +2251,24 @@ document.addEventListener("mousedown", (ev) => {
   /* 面板和里面的控件自己处理点击。 */
   if (ev.target.closest("#edge-panel")) return;
 
+  /* 两张图中间的高度把手优先：它压在两张图之间，不属于任何一张图。 */
+  const splitter = ev.target.closest(".graph-split");
+  if (splitter){
+    const top = graphParts(splitter.dataset.splitTop).scroll;
+    const bot = graphParts(splitter.dataset.splitBottom).scroll;
+    splitState = {
+      split: splitter,
+      topId: splitter.dataset.splitTop, botId: splitter.dataset.splitBottom,
+      startY: ev.clientY,
+      hTop: top ? top.clientHeight : 0,
+      hBot: bot ? bot.clientHeight : 0
+    };
+    splitter.classList.add("dragging");
+    document.body.style.userSelect = "none";
+    ev.preventDefault();
+    return;
+  }
+
   const g   = ev.target.closest(".gnode[data-gnode-id]");
   const eEl = ev.target.closest("[data-edge-key]");
 
@@ -2065,16 +2293,19 @@ document.addEventListener("mousedown", (ev) => {
     }
   }
 
-  /* 没点在方框上：如果点在关系图的空白处，就平移整张画布。
+  /* 没点在方框上：如果点在关系图的空白处，就平移这张图。
      命中方框优先——不然节点一旦压住空白就再也拖不动了。 */
   if (!g){
     const scroller = ev.target.closest(".graph-scroll");
     if (!scroller) return;
+    const busEl = scroller.closest(".graph-bus[data-gbus]");
+    if (!busEl) return;
     /* 点空白 = 取消选中。 */
     if (selectedEdge){ selectedEdge = null; closeEdgePanel(); renderGraph(); }
+    const v = graphView(busEl.dataset.gbus);
     panState = {
-      scroller, startX: ev.clientX, startY: ev.clientY,
-      sl: scroller.scrollLeft, st: scroller.scrollTop
+      busId: busEl.dataset.gbus, startX: ev.clientX, startY: ev.clientY,
+      tx0: v.tx, ty0: v.ty
     };
     scroller.classList.add("panning");
     document.body.style.userSelect = "none";
@@ -2085,46 +2316,67 @@ document.addEventListener("mousedown", (ev) => {
   const m = /translate\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*\)/.exec(g.getAttribute("transform") || "");
   if (!m) return;
   const pt = svgPoint(g.ownerSVGElement, ev);
+  const rec = findNode(g.dataset.gnodeId);
   dragState = {
     g, nodeId: g.dataset.gnodeId, moved: false, last: null,
+    busId: g.dataset.gbus, name: rec ? rec.node.name : null,
+    x0: parseFloat(m[1]), y0: parseFloat(m[2]),
     offX: pt.x - parseFloat(m[1]), offY: pt.y - parseFloat(m[2]),
     startX: ev.clientX, startY: ev.clientY
   };
   ev.preventDefault();
 });
 
-/* Ctrl + 滚轮缩放，以光标为锚点：放大之后指针底下还是原来那个东西。
-   passive:false 是必需的 —— 不然 preventDefault() 不生效，
-   浏览器会同时把页面缩放掉。 */
+/* 滚轮：不按 Ctrl = 平移这张图（滚到头就把事件让给外层，页面还能继续滚）；
+   Ctrl + 滚轮 = 以光标为锚点缩放**光标所在的那一张图**，别的图不受影响。
+   passive:false 是必需的 —— 不然 preventDefault() 不生效。 */
 document.addEventListener("wheel", (ev) => {
-  if (!ev.ctrlKey) return;
   const scroller = ev.target.closest && ev.target.closest(".graph-scroll");
-  const svg = scroller && scroller.querySelector("svg");
-  if (!svg) return;
-  ev.preventDefault();
+  if (!scroller) return;
+  const busEl = scroller.closest(".graph-bus[data-gbus]");
+  if (!busEl) return;
+  const busId = busEl.dataset.gbus;
+  const v = graphView(busId);
 
-  const before = svg.getBoundingClientRect();
-  const vb   = svg.viewBox.baseVal;
-  const old  = graphZoom;
-  const k    = Math.exp(-ev.deltaY * 0.0015);    /* 往上滚 = 放大 */
-  const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, old * k));
-  if (next === old) return;
+  if (ev.ctrlKey){
+    ev.preventDefault();
+    const r = scroller.getBoundingClientRect();
+    const k = Math.exp(-ev.deltaY * 0.0015);      /* 往上滚 = 放大 */
+    zoomGraphAt(busId, v.zoom * k, ev.clientX - r.left, ev.clientY - r.top);
+    return;
+  }
 
-  /* 光标处的「逻辑坐标」缩放前后必须停在原地。
-     它在内容里的位置是 cx（逻辑坐标），对应的像素位置是 px；
-     缩放后 cx 会跑到 cx*(next/old) 处，把滚动条补上这个差值即可。 */
-  const px = ev.clientX - before.left, py = ev.clientY - before.top;
-  const cx = px * (vb.width  / (before.width  || 1));
-  const cy = py * (vb.height / (before.height || 1));
-
-  setGraphZoom(next);                            /* next 可能被夹住，所以用实际值算 */
-
-  const grow = next / old;
-  scroller.scrollLeft += cx * grow - px;
-  scroller.scrollTop  += cy * grow - py;
+  const beforeX = v.tx, beforeY = v.ty;
+  v.tx -= ev.deltaX || 0;
+  v.ty -= ev.deltaY || 0;
+  applyGraphView(busId);
+  if (v.tx !== beforeX || v.ty !== beforeY) ev.preventDefault();
 }, { passive: false });
 
+/* 双击空白处：把这张图重新摆回正中。图可以被拖出可视区，拖丢了用这个找回。 */
+document.addEventListener("dblclick", (ev) => {
+  if (ev.target.closest(".gnode[data-gnode-id]")) return;
+  if (ev.target.closest("[data-edge-key]")) return;
+  const scroller = ev.target.closest && ev.target.closest(".graph-scroll");
+  if (!scroller) return;
+  const busEl = scroller.closest(".graph-bus[data-gbus]");
+  if (!busEl) return;
+  centerGraphView(busEl.dataset.gbus);
+});
+
 document.addEventListener("mousemove", (ev) => {
+  if (splitState){
+    const MIN = 140;
+    let dy = ev.clientY - splitState.startY;
+    /* 两张图都不能小于 MIN，所以 dy 必须同时满足
+         上图 + dy ≥ MIN  且  下图 − dy ≥ MIN
+       也就是 dy ∈ [MIN − 上图, 下图 − MIN]。夹在这个区间里，两者之和保持不变。 */
+    dy = Math.max(MIN - splitState.hTop, Math.min(splitState.hBot - MIN, dy));
+    setGraphHeight(splitState.topId, splitState.hTop + dy);
+    setGraphHeight(splitState.botId, splitState.hBot - dy);
+    return;
+  }
+
   if (edgeState){
     if (!edgeState.moved &&
         Math.abs(ev.clientX - edgeState.startX) + Math.abs(ev.clientY - edgeState.startY) > 3)
@@ -2140,9 +2392,12 @@ document.addEventListener("mousemove", (ev) => {
   }
 
   if (panState){
-    /* 往哪边拖，内容就往哪边走：所以是「减去」位移。 */
-    panState.scroller.scrollLeft = panState.sl - (ev.clientX - panState.startX);
-    panState.scroller.scrollTop  = panState.st - (ev.clientY - panState.startY);
+    /* 往哪边拖，内容就往哪边走；边界由 applyGraphView() 夹住 ——
+       最多拖到图刚好看不见（图的另一条边贴住可视框的对应边），再拖就停在那儿。 */
+    const v = graphView(panState.busId);
+    v.tx = panState.tx0 + (ev.clientX - panState.startX);
+    v.ty = panState.ty0 + (ev.clientY - panState.startY);
+    applyGraphView(panState.busId);
     return;
   }
 
@@ -2155,7 +2410,11 @@ document.addEventListener("mousemove", (ev) => {
   const pt = svgPoint(dragState.g.ownerSVGElement, ev);
   const x = Math.max(0, pt.x - dragState.offX);
   const y = Math.max(0, pt.y - dragState.offY);
-  dragState.g.setAttribute("transform", `translate(${x},${y})`);
+  dragState.g.setAttribute("transform", `translate(${x},${y})`);  /* 连线跟着节点走：把「节点现在画在哪」更新掉，再按重绘那套算法重算
+     挂在这个节点上的线。这样每一帧的形状都等于松手重绘后会得到的形状，
+     松手那一帧就不会再跳一下。 */
+  graphPos.set(dragState.nodeId, { x, y });
+  relayoutNodeEdges(dragState.busId, dragState.nodeId, dragState.name);
   dragState.last = { x, y };
 
   /* 拖着拖着把画布撑大。只改 transform 不改 viewBox 的话，指针一越过边界
@@ -2174,13 +2433,22 @@ document.addEventListener("mousemove", (ev) => {
     svg.setAttribute("width", w);
     svg.setAttribute("height", h);
     svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
-    applyGraphZoom();
+    /* 只重算尺寸和位移，不做边界修正：画布刚变大，这时候把位移夹一下
+       会把鼠标底下的节点挪走。 */
+    applyGraphView(dragState.busId, false);
   }
 
   document.body.style.userSelect = "none";
 });
 
 document.addEventListener("mouseup", () => {
+  if (splitState){
+    splitState.split.classList.remove("dragging");
+    document.body.style.userSelect = "";
+    splitState = null;
+    return;
+  }
+
   if (edgeState){
     document.body.style.userSelect = "";
     const st = edgeState;
@@ -2195,6 +2463,13 @@ document.addEventListener("mouseup", () => {
           dx: Math.round(st.last.ox - info.laneX),
           dy: Math.round(st.last.oy - info.laneY)
         });
+        /* 内存里的几何信息也要跟上这次拖动的结果（用没取整的值，和屏幕上
+           画着的那条线一致）。否则接着拖节点时，relayoutNodeEdges() 会拿
+           旧的手工偏移重算，这条线又「弹」回去一次。 */
+        info.sdx = st.last.ox - info.laneX;
+        info.sdy = st.last.oy - info.laneY;
+        info.ox = st.last.ox;
+        info.oy = st.last.oy;
         schedulePersist();
       }
     } else {
@@ -2210,7 +2485,8 @@ document.addEventListener("mouseup", () => {
   }
 
   if (panState){
-    panState.scroller.classList.remove("panning");
+    const sc = graphParts(panState.busId).scroll;
+    if (sc) sc.classList.remove("panning");
     document.body.style.userSelect = "";
     panState = null;
     return;
@@ -2443,10 +2719,12 @@ document.addEventListener("click", (ev) => {
     commit();
     return;
   }
-  /* 缩放只动视野，不碰文档 —— 所以不走 commit()，不然会把表格视图也重绘一遍。 */
-  if (act === "zoom-in")    { setGraphZoom(graphZoom * 1.2); return; }
-  if (act === "zoom-out")   { setGraphZoom(graphZoom / 1.2); return; }
-  if (act === "zoom-reset") { setGraphZoom(1);               return; }
+  /* 缩放 / 平移只动视野，不碰文档 —— 所以不走 commit()，不然会把表格视图也重绘一遍。
+     每张图独立：按钮带 data-bus，只影响自己那张。 */
+  if (act === "zoom-in")    { zoomGraphAt(bid, graphView(bid).zoom * 1.2); return; }
+  if (act === "zoom-out")   { zoomGraphAt(bid, graphView(bid).zoom / 1.2); return; }
+  if (act === "zoom-reset") { resetGraphView(bid); return; }
+  if (act === "zoom-fit")   { fitGraphView(bid);   return; }
 });
 
 /* ── 改颜色的小面板 ──────────────────────────────────────────────────────
